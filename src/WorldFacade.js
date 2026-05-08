@@ -562,7 +562,7 @@ class WorldFacade {
   // Searching the sum directly is 1/100 hit rate; searching each sub-die independently is
   // 1/10 × 1/10 — same expected attempt count as a d20. The returned seed wraps the inner
   // d10's seed under .d10Seed; world.onscreen unpacks it for the d10's separate addDie.
-  async searchSeed(dieType, targetValue, { theme = this.config.theme, maxAttempts = 100 } = {}) {
+  async searchSeed(dieType, targetValue, { theme = this.config.theme, maxAttempts = 100, bypassPool = false } = {}) {
     const themeData = this.themesLoadedData[theme]
     if (!themeData) throw new Error(`searchSeed: theme '${theme}' not loaded`)
     const meshName = themeData.meshName
@@ -592,7 +592,7 @@ class WorldFacade {
       return this.#dispatchSearch({
         searchId, dieType: 'd100', pair: true,
         tensValue, unitsValue, meshName, maxAttempts: d100MaxAttempts,
-      })
+      }, bypassPool)
     }
 
     // d10 stores 0 in its colliderFaceMap for the "10" face; translate so the search
@@ -600,14 +600,19 @@ class WorldFacade {
     const lookupValue = (dt === 'd10' && targetValue === 10) ? 0 : targetValue
     const searchId = ++this.#searchIndex
     const req = { searchId, dieType: dt, meshName, targetValue: lookupValue, maxAttempts }
-    return this.#dispatchSearch(req)
+    return this.#dispatchSearch(req, bypassPool)
   }
 
   // Layer 2 — try pool first, fall back to single-worker on any pool error (not yet
   // initialized, all-busy, disabled, broadcast not done). The single-worker path is the
   // pre-Layer-2 behavior, so a fully-disabled pool just means "current performance".
-  async #dispatchSearch(req) {
-    if (this.#searchPool && this.#searchPoolReady) {
+  // bypassPool: true forces the single-worker path — used by cold-start warmup so the
+  // main physics worker's search infrastructure (Ammo JIT, search world, btConvexHullShape
+  // cache) gets warmed alongside the pool. Without bypassing, every search after pool init
+  // goes to pool and the main worker stays cold; the first cold-pool fallback would then
+  // pay full cold-start cost mid-roll.
+  async #dispatchSearch(req, bypassPool = false) {
+    if (!bypassPool && this.#searchPool && this.#searchPoolReady) {
       try {
         await this.#searchPoolReady
         return await this.#searchPool.searchSeed(req)
@@ -624,7 +629,7 @@ class WorldFacade {
   // for the visible roll's seeds: [...] API. Hit rate is product of per-die hit rates;
   // 2d20 = 1/400 (~3s p99), 2d6 = 1/36 (~200ms p50). Latency rapidly explodes for >2 dice
   // — recommend qty<=2 for now (Layer 2 worker pool will help).
-  async searchMultiSeed(dieTypes, targetValues, { theme = this.config.theme, maxAttempts = 500 } = {}) {
+  async searchMultiSeed(dieTypes, targetValues, { theme = this.config.theme, maxAttempts = 500, bypassPool = false } = {}) {
     const themeData = this.themesLoadedData[theme]
     if (!themeData) throw new Error(`searchMultiSeed: theme '${theme}' not loaded`)
     const meshName = themeData.meshName
@@ -638,7 +643,7 @@ class WorldFacade {
       dieTypes: normalizedTypes,
       targetValues: lookupValues,
       meshName, maxAttempts,
-    })
+    }, bypassPool)
     if (result && result.found && result.seed) {
       // physics worker bundles seeds[1..] under seed.extraSeeds; flatten to a clean array
       const head = { ...result.seed }
