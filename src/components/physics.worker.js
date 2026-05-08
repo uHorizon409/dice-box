@@ -25,6 +25,54 @@ let stopLoop = false
 const faceData = {}
 let searchIndex = 0
 
+// collision-filtering: each broadcast unit (collection) gets a unique slot bit; dice in the
+// same collection share a slot (so they collide with each other, matching simulateOnceN's
+// shared-search-world physics) but ignore dice from other collections (so concurrent rolls
+// from different players don't perturb each other's seeded trajectories). bit 0 = walls.
+// 15 slot bits covers 4-8 player tables with margin; on exhaustion we fall back to a
+// promiscuous slot that collides with everything — restoring pre-fix behavior for the
+// overflow only. cross-client coherence is preserved per-client because the property
+// "collides with walls only + own collection" is identical regardless of slot bit value.
+const GROUP_WALL = 0x0001
+const MASK_WALL  = 0xFFFF
+const SEARCH_SLOT = 1 << 15  // fixed bit for search worlds (separate Ammo world, no overlap)
+const PROMISCUOUS = 0xFFFE   // all dice bits ORed; mask=0xFFFF
+const SLOT_BITS = []
+for (let i = 1; i <= 15; i++) SLOT_BITS.push(1 << i)
+
+const slotPool = {
+	free: SLOT_BITS.slice(),
+	used: new Map(), // collectionId -> { slot, refCount, promiscuous }
+	acquire(key) {
+		if (key === undefined || key === null) key = '__legacy__'
+		const existing = this.used.get(key)
+		if (existing) { existing.refCount++; return existing.slot }
+		if (this.free.length === 0) {
+			console.warn('[dice-box] slot pool exhausted (>15 concurrent collections); collection', key,
+				'falling back to promiscuous slot — seeded rolls from this collection may diverge across clients')
+			this.used.set(key, { slot: PROMISCUOUS, refCount: 1, promiscuous: true })
+			return PROMISCUOUS
+		}
+		const slot = this.free.pop()
+		this.used.set(key, { slot, refCount: 1, promiscuous: false })
+		return slot
+	},
+	release(key) {
+		if (key === undefined || key === null) key = '__legacy__'
+		const entry = this.used.get(key)
+		if (!entry) return
+		if (--entry.refCount > 0) return
+		if (!entry.promiscuous) this.free.push(entry.slot)
+		this.used.delete(key)
+	},
+	resetAll() {
+		this.free = SLOT_BITS.slice()
+		this.used.clear()
+	},
+}
+
+const maskForSlot = (slot) => (slot === PROMISCUOUS) ? 0xFFFF : (GROUP_WALL | slot)
+
 const defaultOptions = {
 	size: 9.5,
 	startingHeight: 8,
@@ -44,6 +92,10 @@ let config = {...defaultOptions}
 
 let emptyVector
 let diceBufferView
+// reused across the hot collision-detection loop in update(); the original code allocated
+// a fresh btVector3 per contact-point per frame and never destroyed it — at 60fps with
+// ~30 contacts/frame, OOMs Ammo's wasm heap inside ~5 minutes of sustained rolling
+let relativeVelocityScratch
 
 self.onmessage = (e) => {
   switch (e.data.action) {
@@ -207,6 +259,7 @@ const init = async (data) => {
 	tmpBtTrans = new Ammo.btTransform()
 	sharedVector3 = new Ammo.btVector3(0, 0, 0)
 	emptyVector = setVector3(0,0,0)
+	relativeVelocityScratch = new Ammo.btVector3(0, 0, 0)
 
 	setStartPosition()
 
@@ -343,9 +396,11 @@ const createRigidBody = (collisionShape, params) => {
 	// console.log(`collisionShape scaling `, collisionShape.getLocalScaling().x(),collisionShape.getLocalScaling().y(),collisionShape.getLocalScaling().z())
 	transform.setIdentity()
 	transform.setOrigin(setVector3(pos[0], pos[1], pos[2]))
-	transform.setRotation(
-		new Ammo.btQuaternion(quat[0], quat[1], quat[2], quat[3])
-	)
+	// hold the quaternion in a local so it can be destroyed alongside the body — without
+	// retaining the reference setRotation copies the value but the original allocation
+	// leaks each time createRigidBody runs (search-attempt hot path)
+	const btQuat = new Ammo.btQuaternion(quat[0], quat[1], quat[2], quat[3])
+	transform.setRotation(btQuat)
 	// collisionShape.setLocalScaling(new Ammo.btVector3(1.1, -1.1, 1.1))
 	// transform.ScalingToRef()
 	// set the scale of the collider
@@ -362,7 +417,13 @@ const createRigidBody = (collisionShape, params) => {
 		localInertia
 	)
 	const rigidBody = new Ammo.btRigidBody(rbInfo)
-	
+
+	// attach auxiliaries so destroyBody() below can reclaim the full chain. Without this,
+	// a long soak (200 rolls × ~50 search attempts/roll) leaks ~280 bytes/body and OOMs
+	// Ammo's wasm heap inside ~5 minutes. localInertia is the shared sharedVector3 so
+	// not a leak source.
+	rigidBody.aux = { transform, motionState, rbInfo, btQuat }
+
 	// rigid body properties
 	if (mass > 0) rigidBody.setActivationState(4) // Disable deactivation
 	rigidBody.setCollisionFlags(collisionFlags)
@@ -376,10 +437,27 @@ const createRigidBody = (collisionShape, params) => {
 	return rigidBody
 
 }
-// cache for box parts so it can be removed after a new one has been made
+
+// destroy a body created via createRigidBody, reclaiming all chained Ammo allocations.
+// must be called AFTER physicsWorld.removeRigidBody() — destroying a body still in the
+// world will crash the physics step on the next tick.
+const destroyBody = (body) => {
+	if (body.aux) {
+		Ammo.destroy(body.aux.rbInfo)
+		Ammo.destroy(body.aux.motionState)
+		Ammo.destroy(body.aux.transform)
+		Ammo.destroy(body.aux.btQuat)
+	}
+	Ammo.destroy(body)
+}
+// cache for box parts + their construction auxiliaries so resize (which calls
+// removeBoxFromWorld then rebuilds) can fully reclaim wasm allocations. Without aux
+// tracking, every window-resize leaks 6 walls × (transform + shape + motionState + rbInfo).
 let boxParts = []
+let boxPartsAux = []
 const addBoxToWorld = (size, height) => {
 	const tempParts = []
+	const tempAux = []
 	// ground
 	const localInertia = setVector3(0, 0, 0);
 
@@ -393,8 +471,9 @@ const addBoxToWorld = (size, height) => {
 	groundBody.id='box_bottom'
 	groundBody.setFriction(config.friction)
 	groundBody.setRestitution(config.restitution)
-	physicsWorld.addRigidBody(groundBody)
+	physicsWorld.addRigidBody(groundBody, GROUP_WALL, MASK_WALL)
 	tempParts.push(groundBody)
+	tempAux.push({ transform: groundTransform, shape: groundShape, motionState: groundMotionState, rbInfo: groundInfo })
 
 	const ceilingTransform = new Ammo.btTransform()
 	ceilingTransform.setIdentity()
@@ -406,8 +485,9 @@ const addBoxToWorld = (size, height) => {
 	ceilingBody.id='box_top'
 	ceilingBody.setFriction(config.friction)
 	ceilingBody.setRestitution(config.restitution)
-	physicsWorld.addRigidBody(ceilingBody)
+	physicsWorld.addRigidBody(ceilingBody, GROUP_WALL, MASK_WALL)
 	tempParts.push(ceilingBody)
+	tempAux.push({ transform: ceilingTransform, shape: ceilingShape, motionState: ceilingMotionState, rbInfo: ceilingInfo })
 
 	const wallTopTransform = new Ammo.btTransform()
 	wallTopTransform.setIdentity()
@@ -419,8 +499,9 @@ const addBoxToWorld = (size, height) => {
 	topBody.id='box_wall_north'
 	topBody.setFriction(config.friction)
 	topBody.setRestitution(config.restitution)
-	physicsWorld.addRigidBody(topBody)
+	physicsWorld.addRigidBody(topBody, GROUP_WALL, MASK_WALL)
 	tempParts.push(topBody)
+	tempAux.push({ transform: wallTopTransform, shape: wallTopShape, motionState: topMotionState, rbInfo: topInfo })
 
 	const wallBottomTransform = new Ammo.btTransform()
 	wallBottomTransform.setIdentity()
@@ -432,8 +513,9 @@ const addBoxToWorld = (size, height) => {
 	bottomBody.id='box_wall_south'
 	bottomBody.setFriction(config.friction)
 	bottomBody.setRestitution(config.restitution)
-	physicsWorld.addRigidBody(bottomBody)
+	physicsWorld.addRigidBody(bottomBody, GROUP_WALL, MASK_WALL)
 	tempParts.push(bottomBody)
+	tempAux.push({ transform: wallBottomTransform, shape: wallBottomShape, motionState: bottomMotionState, rbInfo: bottomInfo })
 
 	const wallRightTransform = new Ammo.btTransform()
 	wallRightTransform.setIdentity()
@@ -445,8 +527,9 @@ const addBoxToWorld = (size, height) => {
 	rightBody.id='box_wall_east'
 	rightBody.setFriction(config.friction)
 	rightBody.setRestitution(config.restitution)
-	physicsWorld.addRigidBody(rightBody)
+	physicsWorld.addRigidBody(rightBody, GROUP_WALL, MASK_WALL)
 	tempParts.push(rightBody)
+	tempAux.push({ transform: wallRightTransform, shape: wallRightShape, motionState: rightMotionState, rbInfo: rightInfo })
 
 	const wallLeftTransform = new Ammo.btTransform()
 	wallLeftTransform.setIdentity()
@@ -458,21 +541,33 @@ const addBoxToWorld = (size, height) => {
 	leftBody.id='box_wall_west'
 	leftBody.setFriction(config.friction)
 	leftBody.setRestitution(config.restitution)
-	physicsWorld.addRigidBody(leftBody)
+	physicsWorld.addRigidBody(leftBody, GROUP_WALL, MASK_WALL)
 	tempParts.push(leftBody)
+	tempAux.push({ transform: wallLeftTransform, shape: wallLeftShape, motionState: leftMotionState, rbInfo: leftInfo })
 
 	if(boxParts.length){
 		removeBoxFromWorld()
 	}
 	boxParts = [...tempParts]
+	boxPartsAux = [...tempAux]
 }
 
 const removeBoxFromWorld = () => {
-	boxParts.forEach(part => physicsWorld.removeRigidBody(part))
+	for (let i = 0; i < boxParts.length; i++) {
+		physicsWorld.removeRigidBody(boxParts[i])
+		Ammo.destroy(boxParts[i])
+		const a = boxPartsAux[i]
+		Ammo.destroy(a.rbInfo)
+		Ammo.destroy(a.motionState)
+		Ammo.destroy(a.transform)
+		Ammo.destroy(a.shape)
+	}
+	boxParts = []
+	boxPartsAux = []
 }
 
 const addDie = (options) => {
-	const { sides, id, meshName, scale, seed } = options
+	const { sides, id, meshName, scale, seed, collectionId } = options
 	const dieType = Number.isInteger(sides) ? `d${sides}` : sides
 	let cType = `${dieType}_collider`
 	const comboKey = `${meshName}_${cType}`
@@ -492,7 +587,12 @@ const addDie = (options) => {
 	newDie.id = id
 	newDie.timeout = config.settleTimeout
 	newDie.mass = mass
-	physicsWorld.addRigidBody(newDie)
+	// per-collection slot: dice from the same broadcast cluster (matching searchMultiSeed's
+	// shared search world); cross-collection dice ghost through each other so concurrent
+	// rolls don't perturb seeded trajectories
+	const slot = slotPool.acquire(collectionId)
+	newDie.collectionKey = (collectionId === undefined || collectionId === null) ? '__legacy__' : collectionId
+	physicsWorld.addRigidBody(newDie, slot, maskForSlot(slot))
 	bodies.push(newDie)
 
 	return newDie
@@ -534,8 +634,25 @@ const removeDie = (id) => {
 	sleepingBodies = sleepingBodies.filter((die) => {
 		let match = die.id === id
 		if(match){
-			// remove the mesh from the scene
+			slotPool.release(die.collectionKey)
+			// remove the mesh from the scene + reclaim wasm allocation. Without Ammo.destroy
+			// the btRigidBody + chained motionState/transform leak forever; ~5 min of soak
+			// rolling OOMs Ammo's 16MB heap. Auxiliaries created inside createRigidBody
+			// (motionState, btTransform, btQuaternion) aren't exposed so still partial-leak
+			// (~280 bytes/body) — sufficient for sessions but a future cleanup target.
 			physicsWorld.removeRigidBody(die)
+			destroyBody(die)
+		}
+		return !match
+	})
+	// also handle the rare case where remove fires before the die settles — bodies array
+	// is the in-flight set; same release semantics
+	bodies = bodies.filter((die) => {
+		let match = die.id === id
+		if (match) {
+			slotPool.release(die.collectionKey)
+			physicsWorld.removeRigidBody(die)
+			destroyBody(die)
 		}
 		return !match
 	})
@@ -549,12 +666,14 @@ const clearDice = () => {
 		diceBufferView.fill(0)
 	}
 	stopLoop = true
-	// clear all bodies
-	bodies.forEach(body => physicsWorld.removeRigidBody(body))
-	sleepingBodies.forEach(body => physicsWorld.removeRigidBody(body))
+	// clear all bodies + reclaim wasm allocation (see removeDie note on destroyBody)
+	bodies.forEach(body => { physicsWorld.removeRigidBody(body); destroyBody(body) })
+	sleepingBodies.forEach(body => { physicsWorld.removeRigidBody(body); destroyBody(body) })
 	// clear cache arrays
 	bodies = []
 	sleepingBodies = []
+	// reset all in-flight slot allocations — every die is gone, no refcount tracking needed
+	slotPool.resetAll()
 }
 
 
@@ -609,16 +728,16 @@ const update = (delta) => {
                 const velocity0 = body0.getLinearVelocity();
                 const velocity1 = body1.getLinearVelocity();
 
-                // Calculate relative velocity
-                const relativeVelocity = new Ammo.btVector3();
-                relativeVelocity.setValue(
+                // reuse module-scope scratch — see top-of-file note. Allocating fresh here
+                // (the original code) leaks a btVector3 per contact-point per frame.
+                relativeVelocityScratch.setValue(
                     velocity0.x() - velocity1.x(),
                     velocity0.y() - velocity1.y(),
                     velocity0.z() - velocity1.z()
                 );
 
                 // Calculate the force (F = m * a) based on velocity and collision normal
-                const collisionForce = normal.dot(relativeVelocity);
+                const collisionForce = normal.dot(relativeVelocityScratch);
                 totalForce += Math.abs(collisionForce);  // Add to total collision force
 							}
 						}
@@ -736,11 +855,14 @@ const generateRandomSeed = () => {
 	return { startPos, rotation, linearVel, angularImpulse }
 }
 
-// Build the production six-wall box on a caller-supplied search world. Returns the body
-// handles so the caller can clean them up after the search is done.
+// Build the production six-wall box on a caller-supplied search world. Returns body handles
+// AND their construction auxiliaries so resetSearchWorld can fully reclaim wasm allocations
+// (transform, shape, motionState, rbInfo per wall — leaking these per resetSearchWorld OOMs
+// the heap inside ~80 seconds of soak rolling).
 const addSearchBoxToWorld = (world, size, height) => {
 	const localInertia = setVector3(0, 0, 0)
 	const parts = []
+	const aux = []
 
 	const groundT = new Ammo.btTransform()
 	groundT.setIdentity()
@@ -751,8 +873,9 @@ const addSearchBoxToWorld = (world, size, height) => {
 	const groundBody = new Ammo.btRigidBody(groundInfo)
 	groundBody.setFriction(config.friction)
 	groundBody.setRestitution(config.restitution)
-	world.addRigidBody(groundBody)
+	world.addRigidBody(groundBody, GROUP_WALL, MASK_WALL)
 	parts.push(groundBody)
+	aux.push({ transform: groundT, shape: groundShape, motionState: groundMS, rbInfo: groundInfo })
 
 	const ceilingT = new Ammo.btTransform()
 	ceilingT.setIdentity()
@@ -763,8 +886,9 @@ const addSearchBoxToWorld = (world, size, height) => {
 	const ceilingBody = new Ammo.btRigidBody(ceilingInfo)
 	ceilingBody.setFriction(config.friction)
 	ceilingBody.setRestitution(config.restitution)
-	world.addRigidBody(ceilingBody)
+	world.addRigidBody(ceilingBody, GROUP_WALL, MASK_WALL)
 	parts.push(ceilingBody)
+	aux.push({ transform: ceilingT, shape: ceilingShape, motionState: ceilingMS, rbInfo: ceilingInfo })
 
 	const wallSpecs = [
 		{ origin: [0, 0, (size / -2) - .5], shape: [size * aspect, height, 1] },
@@ -782,11 +906,12 @@ const addSearchBoxToWorld = (world, size, height) => {
 		const body = new Ammo.btRigidBody(info)
 		body.setFriction(config.friction)
 		body.setRestitution(config.restitution)
-		world.addRigidBody(body)
+		world.addRigidBody(body, GROUP_WALL, MASK_WALL)
 		parts.push(body)
+		aux.push({ transform: t, shape, motionState: ms, rbInfo: info })
 	}
 
-	return parts
+	return { parts, aux }
 }
 
 // Search world: rebuilt fresh per searchSeed call. Avoids OOM from constructing one per
@@ -796,6 +921,8 @@ const addSearchBoxToWorld = (world, size, height) => {
 // a pool of N reusable worlds with explicit reset between checkout cycles.
 let searchWorld = null
 let searchWorldWalls = []
+let searchWorldWallAux = []
+let searchWorldInfra = null  // { cc, dispatcher, broadphase, solver } — destroyed on reset
 
 const ensureSearchWorld = () => {
 	if (searchWorld) return
@@ -805,20 +932,38 @@ const ensureSearchWorld = () => {
 	const solver = new Ammo.btSequentialImpulseConstraintSolver()
 	const world = new Ammo.btDiscreteDynamicsWorld(dispatcher, broadphase, solver, cc)
 	world.setGravity(setVector3(0, -9.81 * config.gravity, 0))
-	searchWorldWalls = addSearchBoxToWorld(world, config.size, config.startingHeight + 10)
+	const wallResult = addSearchBoxToWorld(world, config.size, config.startingHeight + 10)
+	searchWorldWalls = wallResult.parts
+	searchWorldWallAux = wallResult.aux
+	searchWorldInfra = { cc, dispatcher, broadphase, solver }
 	searchWorld = world
 }
 
 // Tear down the search world and rebuild fresh — call before each top-level search to
-// eliminate broadphase/solver state from previous searches.
+// eliminate broadphase/solver state from previous searches. Must reclaim every wasm
+// allocation made in ensureSearchWorld + addSearchBoxToWorld; the prior leak (only
+// destroying body + world) accumulated ~30 wasm objects per search, OOMing inside ~80s.
 const resetSearchWorld = () => {
 	if (searchWorld) {
-		for (const w of searchWorldWalls) {
-			searchWorld.removeRigidBody(w)
-			Ammo.destroy(w)
+		for (let i = 0; i < searchWorldWalls.length; i++) {
+			searchWorld.removeRigidBody(searchWorldWalls[i])
+			Ammo.destroy(searchWorldWalls[i])
+			const a = searchWorldWallAux[i]
+			Ammo.destroy(a.rbInfo)
+			Ammo.destroy(a.motionState)
+			Ammo.destroy(a.transform)
+			Ammo.destroy(a.shape)
 		}
 		searchWorldWalls = []
+		searchWorldWallAux = []
 		Ammo.destroy(searchWorld)
+		if (searchWorldInfra) {
+			Ammo.destroy(searchWorldInfra.solver)
+			Ammo.destroy(searchWorldInfra.broadphase)
+			Ammo.destroy(searchWorldInfra.dispatcher)
+			Ammo.destroy(searchWorldInfra.cc)
+			searchWorldInfra = null
+		}
 		searchWorld = null
 	}
 	ensureSearchWorld()
@@ -837,7 +982,7 @@ const simulateOnceN = (seeds, dieTypes, meshName) => {
 		const colliderInfo = colliders[cKey]
 		if (!colliderInfo) {
 			// roll back any bodies already added before bailing
-			for (const b of bodies) { searchWorld.removeRigidBody(b); Ammo.destroy(b) }
+			for (const b of bodies) { searchWorld.removeRigidBody(b); destroyBody(b) }
 			return null
 		}
 		const colliderMass = colliderInfo.physicsMass || .1
@@ -849,7 +994,10 @@ const simulateOnceN = (seeds, dieTypes, meshName) => {
 			quat: seeds[k].rotation,
 		})
 		dieBody.mass = mass
-		searchWorld.addRigidBody(dieBody)
+		// search world is rebuilt per top-level search and contains only walls + these dice;
+		// all search dice share SEARCH_SLOT so multi-dice searches collide with each other
+		// (matching the production replay where same-collection dice share a slot too)
+		searchWorld.addRigidBody(dieBody, SEARCH_SLOT, GROUP_WALL | SEARCH_SLOT)
 		dieBody.setLinearVelocity(setVector3(seeds[k].linearVel[0], seeds[k].linearVel[1], seeds[k].linearVel[2]))
 		const force = new Ammo.btVector3(seeds[k].angularImpulse[0], seeds[k].angularImpulse[1], seeds[k].angularImpulse[2])
 		const impulseScale = Math.abs(config.scale - 1) + config.scale * config.scale * (mass / config.mass) * .75
@@ -884,11 +1032,12 @@ const simulateOnceN = (seeds, dieTypes, meshName) => {
 		Ammo.destroy(tmpT)
 	}
 
-	// teardown — remove + destroy each body. motion state/transform/info allocated inside
-	// createRigidBody are not directly accessible and leak per attempt (~280 bytes per body).
+	// teardown — remove + destroyBody reclaims the full chain (body + motionState +
+	// transform + rbInfo + btQuaternion). search hot path runs ~50 attempts per d20 search
+	// so this is the primary leak source under sustained rolling.
 	for (const b of bodies) {
 		searchWorld.removeRigidBody(b)
-		Ammo.destroy(b)
+		destroyBody(b)
 	}
 
 	return results

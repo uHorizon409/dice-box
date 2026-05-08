@@ -348,6 +348,7 @@ class WorldOnscreen {
 				theme: options.theme,
 				meshName: options.meshName,
 				seed: options.seed, // optional: when present, physics replays this exact throw
+				collectionId: options.collectionId, // collision-filter slot key — same broadcast → same slot
 			}
 		})
 	
@@ -373,6 +374,9 @@ class WorldOnscreen {
 					// d100 split-dice (Layer 5): the parent d100's seed wraps the inner d10's
 					// seed under .d10Seed when the roll was started via { seeds: [pairedSeed] }.
 					seed: options.seed ? options.seed.d10Seed : undefined,
+					// inner d10 shares the parent d100's collection so they share a slot and
+					// collide with each other (matches doPairSearch's shared search world)
+					collectionId: options.collectionId,
 				}
 			})
 		}
