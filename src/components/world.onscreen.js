@@ -57,10 +57,13 @@ class WorldOnscreen {
 			scene: this.#scene
 		})
 	
-		// create the box that provides surfaces for shadows to render on
+		// create the box that provides surfaces for shadows to render on. aspect locked
+		// to 1.0 to keep visible walls aligned with the physics walls (which are also
+		// locked to 1.0 for cross-client seed-replay determinism — see physics.worker.js
+		// init() comment for the full rationale).
 		this.#container  = new Container({
 			enableShadows: this.config.enableShadows,
-			aspect: this.#canvas.width / this.#canvas.height,
+			aspect: 1,
 			lights: this.#lights,
 			scene: this.#scene
 		})
@@ -233,6 +236,28 @@ class WorldOnscreen {
 		}
 
 		this.onThemeLoaded({id: theme})
+
+		// F1b — prime face data eagerly so searchSeed works on the FIRST user-triggered
+		// roll without requiring a prior add() to populate the cache. Dice.loadModels'
+		// SceneLoader.ImportMeshAsync is fire-and-forget — scene.themeData[meshName]
+		// gets populated after loadTheme returns. Poll every 100ms up to 5s, then ship
+		// face data for every die type the theme provides.
+		this.#primeFaceDataWhenImportReady(meshName)
+	}
+
+	#primeFaceDataWhenImportReady(meshName, attemptsLeft = 50) {
+		const themeData = this.#scene.themeData && this.#scene.themeData[meshName]
+		if (themeData && themeData.colliderFaceMap) {
+			for (const dieType of Object.keys(themeData.colliderFaceMap)) {
+				this.#ensureFaceDataLoaded(meshName, dieType)
+			}
+			return
+		}
+		if (attemptsLeft > 0) {
+			setTimeout(() => this.#primeFaceDataWhenImportReady(meshName, attemptsLeft - 1), 100)
+		} else {
+			console.warn('[dice-box] face data not loaded after polling — search will fall back')
+		}
 	}
 
 	clear() {
@@ -494,10 +519,11 @@ class WorldOnscreen {
 	}
 	
 	resize(options) {
-		// redraw the dicebox
+		// redraw the dicebox. aspect stays locked to 1 (see constructor) — physics walls
+		// are square for cross-client determinism, visible walls match.
 		const width = this.#canvas.width = options.width
 		const height = this.#canvas.height = options.height
-		this.#container.create({aspect: width / height})
+		this.#container.create({aspect: 1})
 		this.#engine.resize()
 	}
 }

@@ -565,6 +565,37 @@ class WorldFacade {
     return this.#DiceWorld.searchSeed({ searchId, dieType: dt, meshName, targetValue: lookupValue, maxAttempts })
   }
 
+  // Multi-dice search: throws N independent dice in the SAME search world (collision-aware,
+  // matches visible playback) until ALL land on their respective targetValues. Returns
+  // { found, seeds: [seed0, seed1, ...] } where seeds[i] is the per-die seed positional
+  // for the visible roll's seeds: [...] API. Hit rate is product of per-die hit rates;
+  // 2d20 = 1/400 (~3s p99), 2d6 = 1/36 (~200ms p50). Latency rapidly explodes for >2 dice
+  // — recommend qty<=2 for now (Layer 2 worker pool will help).
+  async searchMultiSeed(dieTypes, targetValues, { theme = this.config.theme, maxAttempts = 500 } = {}) {
+    const themeData = this.themesLoadedData[theme]
+    if (!themeData) throw new Error(`searchMultiSeed: theme '${theme}' not loaded`)
+    const meshName = themeData.meshName
+    const normalizedTypes = dieTypes.map(dt =>
+      (typeof dt === 'number' || /^\d+$/.test(String(dt))) ? `d${dt}` : String(dt))
+    const lookupValues = targetValues.map((v, i) =>
+      (normalizedTypes[i] === 'd10' && v === 10) ? 0 : v)
+    const searchId = ++this.#searchIndex
+    const result = await this.#DiceWorld.searchSeed({
+      searchId, multi: true,
+      dieTypes: normalizedTypes,
+      targetValues: lookupValues,
+      meshName, maxAttempts,
+    })
+    if (result && result.found && result.seed) {
+      // physics worker bundles seeds[1..] under seed.extraSeeds; flatten to a clean array
+      const head = { ...result.seed }
+      const extras = head.extraSeeds || []
+      delete head.extraSeeds
+      return { ...result, seeds: [head, ...extras] }
+    }
+    return result
+  }
+
 	reroll(notation, {remove = false, hide = false, newStartPoint = true} = {}) {
 		// TODO: add hide if you want to keep the die result for an external parser
 

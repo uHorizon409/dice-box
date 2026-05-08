@@ -66,7 +66,7 @@ self.onmessage = (e) => {
 		case "resize":
 			width = e.data.width
 			height = e.data.height
-			aspect = width / height
+			// aspect remains locked at 1.0 — see init() comment for determinism rationale
 			addBoxToWorld(config.size, config.startingHeight + 10)
 			break
 		case "updateConfig":
@@ -133,7 +133,11 @@ self.onmessage = (e) => {
 						// position/velocity/angularVelocity/rotation) that lands the die on the
 						// requested face value. result posted back via "searchResult".
 						// pair: true → d100 split-search (d100 + inner d10 in same search world)
-						if (e.data.pair) doPairSearch(e.data)
+						// multi: true → N-dice search (e.g. 2d20 advantage, with both bodies
+						// throwing in same world to keep collision dynamics consistent with
+						// the visible playback)
+						if (e.data.multi) doMultiSearch(e.data)
+						else if (e.data.pair) doPairSearch(e.data)
 						else doSearch(e.data)
 						break
           default:
@@ -179,7 +183,12 @@ const computeStartingHeight = (height = defaultOptions.startingHeight) => {
 const init = async (data) => {
 	width = data.width
 	height = data.height
-	aspect = width / height
+	// Physics aspect locked to 1.0 for deterministic seed replay across clients.
+	// Different canvas dimensions per client would otherwise produce different physics
+	// wall geometry, causing identical seeds to diverge during multi-bounce. Dice cluster
+	// centrally rather than spreading to canvas edges — acceptable trade-off for
+	// synchronized cross-client physics.
+	aspect = 1
 
 	config = {...config,...data.options}
 	config.gravity = computeGravity(config.gravity, config.mass)
@@ -959,6 +968,64 @@ const doPairSearch = (req) => {
 				attempts: attempt, elapsedMs: elapsed,
 				// (0,0) → 100 per dice-box convention, otherwise straight sum
 				restingValue: (tensValue === 0 && unitsValue === 0) ? 100 : tensValue + unitsValue,
+			})
+			return
+		}
+	}
+
+	const elapsed = ((typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now()) - start
+	worldWorkerPort.postMessage({
+		action: 'searchResult', searchId, found: false,
+		attempts: maxAttempts, elapsedMs: elapsed,
+	})
+}
+
+// Multi-dice rejection sampling: throw N independent dice in the SAME search world (so
+// collision dynamics mirror visible playback) until ALL land on their respective targets.
+// Returns a paired seed where each subsequent die's seed is nested under .d10Seed-style
+// chained property (the visible playback path uses options.seed.d10Seed for d100; for
+// other multi-die we use a generic .extraSeeds: [seed1, seed2, ...] array).
+//
+// Hit rate is product of per-die hit rates: 2d20 = 1/400, 4d6 = 1/1296. Latency scales
+// accordingly. Default cap bumped per req; caller should size maxAttempts to the case.
+const doMultiSearch = (req) => {
+	const { searchId, meshName, dieTypes, targetValues, maxAttempts = 500 } = req
+	const start = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now()
+
+	// validate face data + colliders for every die type involved
+	for (const dt of dieTypes) {
+		const faceKey = `${meshName}_${dt}`
+		const colliderKey = `${meshName}_${dt}_collider`
+		if (!faceData[faceKey] || !colliders[colliderKey]) {
+			worldWorkerPort.postMessage({
+				action: 'searchResult', searchId, found: false,
+				error: `missing_face_data_or_collider:${dt}`, attempts: 0,
+			})
+			return
+		}
+	}
+
+	resetSearchWorld()
+
+	for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+		const seeds = dieTypes.map(() => generateRandomSeed())
+		const results = simulateOnceN(seeds, dieTypes, meshName)
+		if (!results) continue
+		// check all dice match their targets
+		let ok = true
+		for (let k = 0; k < dieTypes.length; k++) {
+			const v = evaluateFace(results[k], `${meshName}_${dieTypes[k]}`)
+			if (v !== targetValues[k]) { ok = false; break }
+		}
+		if (ok) {
+			const elapsed = ((typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now()) - start
+			// primary seed is seeds[0]; remaining seeds delivered via extraSeeds for
+			// world.onscreen to forward to subsequent addDie calls in this collection
+			worldWorkerPort.postMessage({
+				action: 'searchResult', searchId, found: true,
+				seed: { ...seeds[0], extraSeeds: seeds.slice(1) },
+				attempts: attempt, elapsedMs: elapsed,
+				restingValues: targetValues.slice(),
 			})
 			return
 		}
