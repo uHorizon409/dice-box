@@ -298,9 +298,17 @@ class Dice {
     const toQ = d._forcedTargetQ.clone()
     const startY = d.mesh.position.y
     const cfgScale = (d.config && d.config.scale) || 5
-    // reduced from 0.4 to 0.15 so the die looks like it's tipping onto an edge rather
-    // than hopping clear off the table — real settling dice don't visibly leave the floor
-    const liftHeight = cfgScale * 0.15
+    // skip-lift on small angle: dice already within ~30° of target only need a rotation
+    // nudge — the lift exists to clear obstructions during big rotations, but small
+    // rotations look more natural without any vertical motion at all (just settling
+    // into final alignment). Strongest masking lever for "looks rigged" since a die
+    // that doesn't visibly leave the floor reads as physics finishing, not animation.
+    // angle between unit quaternions = 2 * acos(|dot|), clamped for numerical safety.
+    const dot = Math.abs(Quaternion.Dot(fromQ, toQ))
+    const angle = 2 * Math.acos(Math.min(1, dot))
+    // base lift reduced from 0.4 to 0.15 so even big-angle dice look like they tip onto
+    // an edge rather than hopping clear off the table
+    const liftHeight = (angle < Math.PI / 6) ? 0 : cfgScale * 0.15
     // per-die jitter: 0-300ms start delay + 0.8x-1.3x duration variance. Eight dice with
     // identical 700ms snap profiles read as scripted; spread them across ~300ms-1200ms
     // total elapsed and the eye reads it as independent settling.
