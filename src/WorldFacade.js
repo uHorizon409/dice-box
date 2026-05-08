@@ -1,5 +1,6 @@
 import { createCanvas } from './components/world/canvas'
 import physicsWorker from './components/physics.worker.js?worker&inline'
+import SearchPool, { POOL_SIZE } from './components/searchPool'
 import { debounce, createAsyncQueue, Random, hexToRGB, webgl_support } from './helpers'
 
 const defaultOptions = {
@@ -39,6 +40,8 @@ class WorldFacade {
 	#dicePhysicsPromise
 	#dicePhysicsResolve
 	#webgl_support = true
+	#searchPool = null         // Layer 2 — null until init() spawns it
+	#searchPoolReady = null    // promise resolved when first theme is broadcast to pool
 	noop = () => {}
 
   constructor(options = {}){
@@ -249,11 +252,45 @@ class WorldFacade {
 
     // wait for both DiceWorld and DicePhysics to initialize
 		await Promise.all([this.#diceWorldPromise, this.#dicePhysicsPromise])
-    
+
     if(this.#DicePhysics){
       // set up message channels between Dice World and Dice Physics
       this.#connectWorld()
     }
+
+		// Layer 2 — spawn search pool in parallel with theme load. Pool init is fire-and-
+		// forget; if it fails or hasn't completed when a search fires, searchSeed throws
+		// and WorldFacade falls through to the existing single-worker path.
+		//
+		// Relay-capture fires once per loadModels (1 per theme) and once per loadFaceData
+		// (1 per dieType, ~7 per theme). Forward each immediately; pool queues until init
+		// completes. #searchPoolReady resolves on first faceData capture so searches don't
+		// wait for ALL face data — pool's per-worker missing-face-data check handles
+		// dieTypes that haven't arrived yet (falls through to single-worker for those).
+		if (this.#webgl_support && this.#DiceWorld && POOL_SIZE >= 1) {
+			this.#searchPool = new SearchPool(this.config)
+			this.#searchPool.init({
+				width: this.canvas.clientWidth,
+				height: this.canvas.clientHeight,
+				options: this.config,
+			}).catch(err => console.warn('[search-pool] init rejected', err))
+
+			let firstFaceDataResolved = false
+			this.#searchPoolReady = new Promise(resolve => {
+				this.#DiceWorld.onRelayCapture = ({ kind, payload }) => {
+					if (this.#searchPool.disabled) return
+					if (kind === 'models') {
+						this.#searchPool.loadModels(payload)
+					} else if (kind === 'faceData') {
+						this.#searchPool.loadFaceData(payload)
+						if (!firstFaceDataResolved) {
+							firstFaceDataResolved = true
+							resolve()
+						}
+					}
+				}
+			})
+		}
 
 		// queue load of the theme defined in the config
 		await this.loadThemeQueue.push(() => this.loadTheme(this.config.theme))
@@ -552,7 +589,7 @@ class WorldFacade {
       // parallelism would cut both, but 500 sequential is acceptable until real-play data
       // shows variance issues. Pass an explicit maxAttempts to override.
       const d100MaxAttempts = (typeof maxAttempts === 'number' && maxAttempts !== 100) ? maxAttempts : 500
-      return this.#DiceWorld.searchSeed({
+      return this.#dispatchSearch({
         searchId, dieType: 'd100', pair: true,
         tensValue, unitsValue, meshName, maxAttempts: d100MaxAttempts,
       })
@@ -562,7 +599,23 @@ class WorldFacade {
     // matches against the map value rather than the post-processed display value.
     const lookupValue = (dt === 'd10' && targetValue === 10) ? 0 : targetValue
     const searchId = ++this.#searchIndex
-    return this.#DiceWorld.searchSeed({ searchId, dieType: dt, meshName, targetValue: lookupValue, maxAttempts })
+    const req = { searchId, dieType: dt, meshName, targetValue: lookupValue, maxAttempts }
+    return this.#dispatchSearch(req)
+  }
+
+  // Layer 2 — try pool first, fall back to single-worker on any pool error (not yet
+  // initialized, all-busy, disabled, broadcast not done). The single-worker path is the
+  // pre-Layer-2 behavior, so a fully-disabled pool just means "current performance".
+  async #dispatchSearch(req) {
+    if (this.#searchPool && this.#searchPoolReady) {
+      try {
+        await this.#searchPoolReady
+        return await this.#searchPool.searchSeed(req)
+      } catch (e) {
+        // pool unavailable for this request — silently fall through to single-worker
+      }
+    }
+    return this.#DiceWorld.searchSeed(req)
   }
 
   // Multi-dice search: throws N independent dice in the SAME search world (collision-aware,
@@ -580,7 +633,7 @@ class WorldFacade {
     const lookupValues = targetValues.map((v, i) =>
       (normalizedTypes[i] === 'd10' && v === 10) ? 0 : v)
     const searchId = ++this.#searchIndex
-    const result = await this.#DiceWorld.searchSeed({
+    const result = await this.#dispatchSearch({
       searchId, multi: true,
       dieTypes: normalizedTypes,
       targetValues: lookupValues,

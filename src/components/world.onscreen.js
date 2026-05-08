@@ -132,6 +132,18 @@ class WorldOnscreen {
 			faceNormals[i * 3 + 1] = localNormals[i].y
 			faceNormals[i * 3 + 2] = localNormals[i].z
 		}
+		// Layer 2: relay the same payload to main thread (without transferable list, so it's
+		// structured-cloned) — the search pool intercepts it via offscreenCanvas.worker.js
+		// and broadcasts to every pool worker. Has to happen BEFORE the transferable post
+		// below, because that detaches faceNormals.buffer.
+		self.postMessage({
+			action: "relayLoadFaceData",
+			key,
+			dieType,
+			faceNormalsArr: Array.from(faceNormals),
+			faceMap: themeData.colliderFaceMap[dieType],
+			d4FaceDown: themeData.d4FaceDown,
+		})
 		this.#physicsWorkerPort.postMessage({
 			action: "loadFaceData",
 			key,
@@ -232,6 +244,14 @@ class WorldOnscreen {
 					colliders,
 					meshName
 				}
+			})
+			// Layer 2: relay the same payload to main thread for the search pool. The
+			// payload is plain serializable data (vertex arrays + meta) — structured-clone
+			// handles it. Pool workers reconstruct btConvexHullShape inside their own Ammo
+			// runtime (createConvexHull is invoked per-worker on receipt of "loadModels").
+			self.postMessage({
+				action: "relayLoadModels",
+				options: { colliders, meshName }
 			})
 		}
 

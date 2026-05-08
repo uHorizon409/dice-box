@@ -6,6 +6,12 @@ class WorldOffScreen {
 	themeLoadedInit = false
 	pendingThemePromises = {}
 	pendingSearches = new Map()
+	// Layer 2 search-pool capture: rendering worker mirrors loadModels + loadFaceData
+	// here when each theme is first loaded. WorldFacade reads these to bootstrap pool
+	// workers in their own Ammo runtimes (no rendering pair to do it for them).
+	relayedLoadModels = []   // [{ colliders, meshName }] in load order
+	relayedLoadFaceData = [] // [{ key, dieType, faceNormalsArr, faceMap, d4FaceDown }]
+	onRelayCapture = () => {} // optional hook fired on each capture
 	#offscreenCanvas
 	#OffscreenWorker
 	// onInitComplete = () => {} // init callback
@@ -70,6 +76,20 @@ class WorldOffScreen {
 					}
 					break;
 				}
+				case 'relayLoadModels':
+					this.relayedLoadModels.push(e.data.options)
+					this.onRelayCapture({ kind: 'models', payload: e.data.options })
+					break;
+				case 'relayLoadFaceData':
+					this.relayedLoadFaceData.push({
+						key: e.data.key,
+						dieType: e.data.dieType,
+						faceNormalsArr: e.data.faceNormalsArr,
+						faceMap: e.data.faceMap,
+						d4FaceDown: e.data.d4FaceDown,
+					})
+					this.onRelayCapture({ kind: 'faceData', payload: this.relayedLoadFaceData[this.relayedLoadFaceData.length - 1] })
+					break;
 			}
 		}
 		// await Promise.all([this.#OffscreenWorker.init])

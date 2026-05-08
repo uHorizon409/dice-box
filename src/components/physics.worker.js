@@ -97,17 +97,66 @@ let diceBufferView
 // ~30 contacts/frame, OOMs Ammo's wasm heap inside ~5 minutes of sustained rolling
 let relativeVelocityScratch
 
+// Layer 2 search-only mode: when set true at init, skip physicsWorld + production walls.
+// Pool workers run the search infrastructure only — no rendering pair, no production sim.
+let searchOnlyMode = false
+// pool workers use a top-level "abort" message to cancel an in-flight search early when
+// another pool peer wins the race. doSearch / doMultiSearch / doPairSearch check this
+// between attempts and bail with found:false, aborted:true. cleared at search start.
+let searchAbortFlag = false
+
+// abort signaling is best-effort: web workers process messages serially, so a queued
+// "abort" doesn't get processed until the synchronous search returns. We tried yielding
+// (setTimeout/MessageChannel) to drain the queue between attempts, but both approaches
+// caused pool workers to hang silently in Vite's bundled worker. Keeping search dispatchers
+// synchronous; abort lands when the search completes. Pool benefit is parallelism (K
+// workers searching concurrently), not early-exit. Manager resolves user promise on first
+// hit anyway, so user-visible latency is unaffected — losers just keep running until done.
+
 self.onmessage = (e) => {
   switch (e.data.action) {
     case "rollDie":
       rollDie(e.data.sides)
       break;
     case "init":
+      // Layer 2 pool workers pass searchOnly:true to skip physicsWorld + production walls
+      searchOnlyMode = !!e.data.searchOnly
       init(e.data).then(()=>{
         self.postMessage({
           action:"init-complete"
         })
       })
+      break
+    // Layer 2 pool-worker top-level handlers — pool workers don't have a rendering pair,
+    // so colliders/face-data/searches arrive directly as worker messages rather than via
+    // the worldWorkerPort below.
+    case "loadModels":
+      loadModels(e.data.options)
+      break
+    case "loadFaceData":
+      faceData[e.data.key] = {
+        faceNormals: new Float32Array(e.data.faceNormals),
+        faceMap: e.data.faceMap,
+        d4FaceDown: e.data.d4FaceDown,
+        dieType: e.data.dieType,
+      }
+      break
+    case "searchSeed": {
+      searchAbortFlag = false
+      const reply = (msg) => self.postMessage(msg)
+      try {
+        if (e.data.multi) doMultiSearch(e.data, reply)
+        else if (e.data.pair) doPairSearch(e.data, reply)
+        else doSearch(e.data, reply)
+      } catch (err) {
+        console.error('[physics-worker] search dispatch threw:', err)
+        reply({ action: 'searchResult', searchId: e.data.searchId, found: false, error: String(err) })
+      }
+      break
+    }
+    case "abort":
+      // peer worker won the race — set the flag, doSearch's per-attempt check will bail
+      searchAbortFlag = true
       break
     case "clearDice":
 			clearDice()
@@ -198,7 +247,7 @@ self.onmessage = (e) => {
       }
       break
     default:
-      console.error("action not found in physics worker:", e.data.action)
+      console.error("action not found in physics worker:", e.data.action, "full:", e.data)
   }
 }
 
@@ -263,9 +312,12 @@ const init = async (data) => {
 
 	setStartPosition()
 
-	physicsWorld = setupPhysicsWorld()
-
-	addBoxToWorld(config.size, config.startingHeight + 10)
+	// pool workers (search-only) don't need a production world or visible-box walls;
+	// they only ever drive simulateOnceN through the lazily-built searchWorld
+	if (!searchOnlyMode) {
+		physicsWorld = setupPhysicsWorld()
+		addBoxToWorld(config.size, config.startingHeight + 10)
+	}
 }
 
 const updateConfig = (options) => {
@@ -1084,7 +1136,7 @@ const evaluateFace = (rotation, faceKey) => {
 // Hit rate ~1/100 per attempt instead of 1/10 × 1/10 — but the resulting seeds reproduce
 // faithfully because the visible world has the same collision dynamics. Returns a paired
 // seed where the d10's seed is nested under .d10Seed.
-const doPairSearch = (req) => {
+const doPairSearch = (req, reply = (msg) => worldWorkerPort.postMessage(msg)) => {
 	const { searchId, meshName, tensValue, unitsValue, maxAttempts = 100 } = req
 	const tensFaceKey = `${meshName}_d100`
 	const unitsFaceKey = `${meshName}_d10`
@@ -1092,7 +1144,7 @@ const doPairSearch = (req) => {
 
 	if (!faceData[tensFaceKey] || !faceData[unitsFaceKey]
 		|| !colliders[`${meshName}_d100_collider`] || !colliders[`${meshName}_d10_collider`]) {
-		worldWorkerPort.postMessage({
+		reply({
 			action: 'searchResult', searchId, found: false,
 			error: 'missing_face_data_or_collider', attempts: 0,
 		})
@@ -1103,6 +1155,11 @@ const doPairSearch = (req) => {
 	resetSearchWorld()
 
 	for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+		// pool-coordinated abort: peer worker won the race, bail without burning more cycles
+		if (searchAbortFlag) {
+			reply({ action: 'searchResult', searchId, found: false, aborted: true, attempts: attempt - 1 })
+			return
+		}
 		const tensSeed = generateRandomSeed()
 		const unitsSeed = generateRandomSeed()
 		const results = simulateOnceN([tensSeed, unitsSeed], ['d100', 'd10'], meshName)
@@ -1111,7 +1168,7 @@ const doPairSearch = (req) => {
 		const unitsActual = evaluateFace(results[1], unitsFaceKey)
 		if (tensActual === tensValue && unitsActual === unitsValue) {
 			const elapsed = ((typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now()) - start
-			worldWorkerPort.postMessage({
+			reply({
 				action: 'searchResult', searchId, found: true,
 				seed: { ...tensSeed, d10Seed: unitsSeed },
 				attempts: attempt, elapsedMs: elapsed,
@@ -1123,7 +1180,7 @@ const doPairSearch = (req) => {
 	}
 
 	const elapsed = ((typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now()) - start
-	worldWorkerPort.postMessage({
+	reply({
 		action: 'searchResult', searchId, found: false,
 		attempts: maxAttempts, elapsedMs: elapsed,
 	})
@@ -1137,7 +1194,7 @@ const doPairSearch = (req) => {
 //
 // Hit rate is product of per-die hit rates: 2d20 = 1/400, 4d6 = 1/1296. Latency scales
 // accordingly. Default cap bumped per req; caller should size maxAttempts to the case.
-const doMultiSearch = (req) => {
+const doMultiSearch = (req, reply = (msg) => worldWorkerPort.postMessage(msg)) => {
 	const { searchId, meshName, dieTypes, targetValues, maxAttempts = 500 } = req
 	const start = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now()
 
@@ -1146,7 +1203,7 @@ const doMultiSearch = (req) => {
 		const faceKey = `${meshName}_${dt}`
 		const colliderKey = `${meshName}_${dt}_collider`
 		if (!faceData[faceKey] || !colliders[colliderKey]) {
-			worldWorkerPort.postMessage({
+			reply({
 				action: 'searchResult', searchId, found: false,
 				error: `missing_face_data_or_collider:${dt}`, attempts: 0,
 			})
@@ -1157,6 +1214,10 @@ const doMultiSearch = (req) => {
 	resetSearchWorld()
 
 	for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+		if (searchAbortFlag) {
+			reply({ action: 'searchResult', searchId, found: false, aborted: true, attempts: attempt - 1 })
+			return
+		}
 		const seeds = dieTypes.map(() => generateRandomSeed())
 		const results = simulateOnceN(seeds, dieTypes, meshName)
 		if (!results) continue
@@ -1170,7 +1231,7 @@ const doMultiSearch = (req) => {
 			const elapsed = ((typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now()) - start
 			// primary seed is seeds[0]; remaining seeds delivered via extraSeeds for
 			// world.onscreen to forward to subsequent addDie calls in this collection
-			worldWorkerPort.postMessage({
+			reply({
 				action: 'searchResult', searchId, found: true,
 				seed: { ...seeds[0], extraSeeds: seeds.slice(1) },
 				attempts: attempt, elapsedMs: elapsed,
@@ -1181,7 +1242,7 @@ const doMultiSearch = (req) => {
 	}
 
 	const elapsed = ((typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now()) - start
-	worldWorkerPort.postMessage({
+	reply({
 		action: 'searchResult', searchId, found: false,
 		attempts: maxAttempts, elapsedMs: elapsed,
 	})
@@ -1190,14 +1251,14 @@ const doMultiSearch = (req) => {
 // Sequential rejection sampling. Generates random seeds and simulates each in an isolated
 // world until one lands on targetValue, or maxAttempts exhausted. Posts result back to
 // the rendering worker via "searchResult".
-const doSearch = (req) => {
+const doSearch = (req, reply = (msg) => worldWorkerPort.postMessage(msg)) => {
 	const { searchId, dieType, meshName, targetValue, maxAttempts = 100 } = req
 	const faceKey = `${meshName}_${dieType}`
 	const colliderKey = `${meshName}_${dieType}_collider`
 	const start = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now()
 
 	if (!faceData[faceKey] || !colliders[colliderKey]) {
-		worldWorkerPort.postMessage({
+		reply({
 			action: 'searchResult',
 			searchId,
 			found: false,
@@ -1211,13 +1272,17 @@ const doSearch = (req) => {
 	resetSearchWorld()
 
 	for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+		if (searchAbortFlag) {
+			reply({ action: 'searchResult', searchId, found: false, aborted: true, attempts: attempt - 1 })
+			return
+		}
 		const seed = generateRandomSeed()
 		const finalRotation = simulateOnce(seed, dieType, meshName)
 		if (!finalRotation) continue
 		const value = evaluateFace(finalRotation, faceKey)
 		if (value === targetValue) {
 			const elapsed = ((typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now()) - start
-			worldWorkerPort.postMessage({
+			reply({
 				action: 'searchResult',
 				searchId,
 				found: true,
@@ -1232,7 +1297,7 @@ const doSearch = (req) => {
 	}
 
 	const elapsed = ((typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now()) - start
-	worldWorkerPort.postMessage({
+	reply({
 		action: 'searchResult',
 		searchId,
 		found: false,
