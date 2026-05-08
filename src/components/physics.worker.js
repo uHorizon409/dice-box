@@ -17,6 +17,14 @@ let height = 150
 let aspect = 1
 let stopLoop = false
 
+// face-data cache for forced-roll search infrastructure. populated by rendering worker
+// after each theme loads via the "loadFaceData" message. keyed by `${meshName}_${dieType}`.
+// each entry: { faceNormals: Float32Array (3 floats per face), faceMap: {faceId: value},
+// d4FaceDown: bool }. used in evaluateFace() to determine which face is up after a search
+// simulation, without needing a Babylon scene.
+const faceData = {}
+let searchIndex = 0
+
 const defaultOptions = {
 	size: 9.5,
 	startingHeight: 8,
@@ -76,15 +84,17 @@ self.onmessage = (e) => {
 						// console.log('e.data', e.data)
 						loadModels(e.data.options)
 						break;
-          case "addDie":
-						// toss from all edges
-						// setStartPosition()
-						if(e.data.options.newStartPoint){
+          case "addDie": {
+						// when a seed is supplied, skip random start-position rolling — the seed has
+						// the exact pose to reproduce. otherwise the existing random-throw path runs.
+						const opts = e.data.options
+						if (!opts.seed && opts.newStartPoint) {
 							setStartPosition()
 						}
-            const newDie = addDie(e.data.options)
-						rollDie(newDie)
+						const newDie = addDie(opts)
+						rollDie(newDie, opts.seed)
             break;
+					}
           case "rollDie":
 						// TODO: this won't work, need a die object
             rollDie(e.data.id)
@@ -107,6 +117,23 @@ self.onmessage = (e) => {
 						diceBufferView = new Float32Array(e.data.diceBuffer)
 						loop()
 						break;
+					case "loadFaceData":
+						// rendering worker sends face normals + faceId-to-value map per die type
+						// after a theme loads. these let us evaluate which face is up after a
+						// search simulation without needing a Babylon scene.
+						faceData[e.data.key] = {
+							faceNormals: new Float32Array(e.data.faceNormals),
+							faceMap: e.data.faceMap,
+							d4FaceDown: e.data.d4FaceDown,
+							dieType: e.data.dieType,
+						}
+						break
+					case "searchSeed":
+						// sequential rejection sampling. runs invisibly to find a seed (initial
+						// position/velocity/angularVelocity/rotation) that lands the die on the
+						// requested face value. result posted back via "searchResult".
+						doSearch(e.data)
+						break
           default:
             console.error("action not found in physics worker from worldOffscreen worker:", e.data.action)
         }
@@ -171,7 +198,7 @@ const init = async (data) => {
 	emptyVector = setVector3(0,0,0)
 
 	setStartPosition()
-	
+
 	physicsWorld = setupPhysicsWorld()
 
 	addBoxToWorld(config.size, config.startingHeight + 10)
@@ -434,20 +461,23 @@ const removeBoxFromWorld = () => {
 }
 
 const addDie = (options) => {
-	const { sides, id, meshName, scale} = options
+	const { sides, id, meshName, scale, seed } = options
 	const dieType = Number.isInteger(sides) ? `d${sides}` : sides
 	let cType = `${dieType}_collider`
 	const comboKey = `${meshName}_${cType}`
 	const colliderMass = colliders[comboKey]?.physicsMass || .1
-	const mass = colliderMass * config.mass * config.scale // feature? mass should go up with scale, but it throws off the throwForce and spinForce scaling
-	// TODO: incorporate colliders physicsFriction and physicsRestitution settings
-	// clone the collider
-	const newDie = createRigidBody(colliders[comboKey].convexHull, {
+	const mass = colliderMass * config.mass * config.scale
+	// when a seed is supplied, use its initial pose verbatim so visible playback reproduces
+	// the search-found trajectory exactly. otherwise the production random-pose path runs.
+	const params = {
 		mass,
 		scaling: colliders[comboKey].scaling,
-		pos: config.startPosition,
-		// quat: colliders[cType].rotationQuaternion,
-	})
+		pos: seed ? seed.startPos : config.startPosition,
+	}
+	if (seed && seed.rotation) {
+		params.quat = seed.rotation
+	}
+	const newDie = createRigidBody(colliders[comboKey].convexHull, params)
 	newDie.id = id
 	newDie.timeout = config.settleTimeout
 	newDie.mass = mass
@@ -455,13 +485,22 @@ const addDie = (options) => {
 	bodies.push(newDie)
 
 	return newDie
-	// console.log(`added collider for `, type)
-	// rollDie(newDie)
 }
 
-const rollDie = (die) => {
+// roll the die. no seed = existing random throw envelope. with seed = replay the exact
+// linear velocity + angular impulse that produced the search match, so the visible roll
+// lands on the same face the invisible search did.
+const rollDie = (die, seed) => {
+	if (seed) {
+		die.setLinearVelocity(setVector3(seed.linearVel[0], seed.linearVel[1], seed.linearVel[2]))
+		const force = new Ammo.btVector3(seed.angularImpulse[0], seed.angularImpulse[1], seed.angularImpulse[2])
+		const scale = Math.abs(config.scale - 1) + config.scale * config.scale * (die.mass/config.mass) * .75
+		die.applyImpulse(force, setVector3(scale, scale, scale))
+		Ammo.destroy(force)
+		return
+	}
 
-	// lerp picks a random number between two values
+	// random throw — existing behavior
 	die.setLinearVelocity(setVector3(
 		lerp(-config.startPosition[0] * .5, -config.startPosition[0] * config.throwForce, Math.random()),
 		lerp(-config.startPosition[1], -config.startPosition[1] * 2, Math.random()), // limit the y force to 2
@@ -476,14 +515,8 @@ const rollDie = (die) => {
 		spinny * flippy
 	)
 
-	// attempting to create an envelope for the force influence based on scale and mass
-	// linear scale was no good - this creates a nice power curve
 	const scale = Math.abs(config.scale - 1) + config.scale * config.scale * (die.mass/config.mass) * .75
-
-	// console.log('scale', scale)
-	
 	die.applyImpulse(force, setVector3(scale, scale, scale))
-
 }
 
 const removeDie = (id) => {
@@ -645,4 +678,256 @@ const loop = () => {
 				diceBuffer: diceBufferView.buffer
 			}, [diceBufferView.buffer])
 	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Forced-roll search infrastructure (Layer 1 — sequential rejection sampling)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Generate a random seed (initial pose + linear velocity + angular impulse) within the same
+// envelope the production rollDie + setStartPosition use. Seeds found here can be replayed
+// verbatim in the visible world to reproduce the exact same trajectory.
+const generateRandomSeed = () => {
+	const size = config.size
+	const edgeOffset = .5
+	const xMin = size * aspect / 2 - edgeOffset
+	const xMax = size * aspect / -2 + edgeOffset
+	const yMin = size / 2 - edgeOffset
+	const yMax = size / -2 + edgeOffset
+	const xEnvelope = lerp(xMin, xMax, Math.random())
+	const yEnvelope = lerp(yMin, yMax, Math.random())
+	const tossFromTop = Math.round(Math.random())
+	const tossFromLeft = Math.round(Math.random())
+	const tossX = Math.round(Math.random())
+	const startPos = [
+		tossX ? xEnvelope : tossFromLeft ? xMax : xMin,
+		config.startingHeight,
+		tossX ? (tossFromTop ? yMax : yMin) : yEnvelope,
+	]
+
+	const linearVel = [
+		lerp(-startPos[0] * .5, -startPos[0] * config.throwForce, Math.random()),
+		lerp(-startPos[1], -startPos[1] * 2, Math.random()),
+		lerp(-startPos[2] * .5, -startPos[2] * config.throwForce, Math.random()),
+	]
+
+	const flippy = Math.random() > .5 ? 1 : -1
+	const spinny = lerp(config.spinForce * .5, config.spinForce, Math.random())
+	const angularImpulse = [spinny * flippy, spinny * -flippy, spinny * flippy]
+
+	const rotation = [
+		lerp(-1.5, 1.5, Math.random()),
+		lerp(-1.5, 1.5, Math.random()),
+		lerp(-1.5, 1.5, Math.random()),
+		-1,
+	]
+
+	return { startPos, rotation, linearVel, angularImpulse }
+}
+
+// Build the production six-wall box on a caller-supplied search world. Returns the body
+// handles so the caller can clean them up after the search is done.
+const addSearchBoxToWorld = (world, size, height) => {
+	const localInertia = setVector3(0, 0, 0)
+	const parts = []
+
+	const groundT = new Ammo.btTransform()
+	groundT.setIdentity()
+	groundT.setOrigin(setVector3(0, -.5, 0))
+	const groundShape = new Ammo.btBoxShape(setVector3(size * aspect, 1, size))
+	const groundMS = new Ammo.btDefaultMotionState(groundT)
+	const groundInfo = new Ammo.btRigidBodyConstructionInfo(0, groundMS, groundShape, localInertia)
+	const groundBody = new Ammo.btRigidBody(groundInfo)
+	groundBody.setFriction(config.friction)
+	groundBody.setRestitution(config.restitution)
+	world.addRigidBody(groundBody)
+	parts.push(groundBody)
+
+	const ceilingT = new Ammo.btTransform()
+	ceilingT.setIdentity()
+	ceilingT.setOrigin(setVector3(0, height - .5, 0))
+	const ceilingShape = new Ammo.btBoxShape(setVector3(size * aspect, 1, size))
+	const ceilingMS = new Ammo.btDefaultMotionState(ceilingT)
+	const ceilingInfo = new Ammo.btRigidBodyConstructionInfo(0, ceilingMS, ceilingShape, localInertia)
+	const ceilingBody = new Ammo.btRigidBody(ceilingInfo)
+	ceilingBody.setFriction(config.friction)
+	ceilingBody.setRestitution(config.restitution)
+	world.addRigidBody(ceilingBody)
+	parts.push(ceilingBody)
+
+	const wallSpecs = [
+		{ origin: [0, 0, (size / -2) - .5], shape: [size * aspect, height, 1] },
+		{ origin: [0, 0, (size / 2) + .5], shape: [size * aspect, height, 1] },
+		{ origin: [(size * aspect / -2) - .5, 0, 0], shape: [1, height, size] },
+		{ origin: [(size * aspect / 2) + .5, 0, 0], shape: [1, height, size] },
+	]
+	for (const spec of wallSpecs) {
+		const t = new Ammo.btTransform()
+		t.setIdentity()
+		t.setOrigin(setVector3(spec.origin[0], spec.origin[1], spec.origin[2]))
+		const shape = new Ammo.btBoxShape(setVector3(spec.shape[0], spec.shape[1], spec.shape[2]))
+		const ms = new Ammo.btDefaultMotionState(t)
+		const info = new Ammo.btRigidBodyConstructionInfo(0, ms, shape, localInertia)
+		const body = new Ammo.btRigidBody(info)
+		body.setFriction(config.friction)
+		body.setRestitution(config.restitution)
+		world.addRigidBody(body)
+		parts.push(body)
+	}
+
+	return parts
+}
+
+// Persistent search world: built once, reused across all search attempts. Avoids OOM from
+// constructing+leaking a full Ammo world per attempt. Layer 2 will scale this to a pool of N.
+let searchWorld = null
+
+const ensureSearchWorld = () => {
+	if (searchWorld) return
+	const cc = new Ammo.btDefaultCollisionConfiguration()
+	const dispatcher = new Ammo.btCollisionDispatcher(cc)
+	const broadphase = new Ammo.btDbvtBroadphase()
+	const solver = new Ammo.btSequentialImpulseConstraintSolver()
+	const world = new Ammo.btDiscreteDynamicsWorld(dispatcher, broadphase, solver, cc)
+	world.setGravity(setVector3(0, -9.81 * config.gravity, 0))
+	addSearchBoxToWorld(world, config.size, config.startingHeight + 10)
+	searchWorld = world
+}
+
+// Run one simulation in the persistent search world: add a die thrown with the given seed,
+// fast-forward at fixed 1/90s substeps until settle, read final rotation, remove the die.
+// Returns the resting rotation as [x,y,z,w], or null if the die didn't settle in time.
+const simulateOnce = (seed, dieType, meshName) => {
+	ensureSearchWorld()
+	const cKey = `${meshName}_${dieType}_collider`
+	const colliderInfo = colliders[cKey]
+	if (!colliderInfo) return null
+
+	const colliderMass = colliderInfo.physicsMass || .1
+	const mass = colliderMass * config.mass * config.scale
+	const dieBody = createRigidBody(colliderInfo.convexHull, {
+		mass,
+		scaling: colliderInfo.scaling,
+		pos: seed.startPos,
+		quat: seed.rotation,
+	})
+	dieBody.mass = mass
+	searchWorld.addRigidBody(dieBody)
+
+	dieBody.setLinearVelocity(setVector3(seed.linearVel[0], seed.linearVel[1], seed.linearVel[2]))
+	const force = new Ammo.btVector3(seed.angularImpulse[0], seed.angularImpulse[1], seed.angularImpulse[2])
+	const impulseScale = Math.abs(config.scale - 1) + config.scale * config.scale * (mass / config.mass) * .75
+	dieBody.applyImpulse(force, setVector3(impulseScale, impulseScale, impulseScale))
+	Ammo.destroy(force)
+
+	// fast-forward at 1/90s fixed substeps until settle. cap at ~6.6s of simulated time.
+	const maxSteps = 600
+	let settled = false
+	for (let i = 0; i < maxSteps; i++) {
+		searchWorld.stepSimulation(1/90, 1, 1/90)
+		const speed = dieBody.getLinearVelocity().length()
+		const tilt = dieBody.getAngularVelocity().length()
+		if (speed < .01 && tilt < .005) {
+			settled = true
+			break
+		}
+	}
+
+	let result = null
+	if (settled) {
+		const tmpT = new Ammo.btTransform()
+		dieBody.getMotionState().getWorldTransform(tmpT)
+		const q = tmpT.getRotation()
+		result = [q.x(), q.y(), q.z(), q.w()]
+		Ammo.destroy(tmpT)
+	}
+
+	// remove the die from the world and destroy it. the motion state, construction info, and
+	// transform allocated inside createRigidBody are not directly accessible — they leak per
+	// attempt (~280 bytes total) but at 100 attempts that's only ~28KB. acceptable for Layer 1.
+	searchWorld.removeRigidBody(dieBody)
+	Ammo.destroy(dieBody)
+
+	return result
+}
+
+// Determine which face is up given a final rotation. Rotates each precomputed local face
+// normal by the rotation quaternion, picks the face whose world normal best aligns with
+// (0, ±1, 0), looks up faceMap[faceId] for the value.
+const evaluateFace = (rotation, faceKey) => {
+	const data = faceData[faceKey]
+	if (!data) return null
+	const { faceNormals, faceMap, d4FaceDown, dieType } = data
+	const upY = (dieType === 'd4' && d4FaceDown) ? -1 : 1
+	const qx = rotation[0], qy = rotation[1], qz = rotation[2], qw = rotation[3]
+	const numFaces = faceNormals.length / 3
+	let bestFaceId = -1
+	let bestDot = -Infinity
+	for (let i = 0; i < numFaces; i++) {
+		const nx = faceNormals[i * 3]
+		const ny = faceNormals[i * 3 + 1]
+		const nz = faceNormals[i * 3 + 2]
+		// y-component of q*v*q⁻¹ for unit q. v + qw*(2(u×v)) + 2(u×(u×v)) where u = (qx,qy,qz)
+		const tx = 2 * (qy * nz - qz * ny)
+		const ty = 2 * (qz * nx - qx * nz)
+		const tz = 2 * (qx * ny - qy * nx)
+		const ry = ny + qw * ty + (qz * tx - qx * tz)
+		const dot = upY * ry
+		if (dot > bestDot) {
+			bestDot = dot
+			bestFaceId = i
+		}
+	}
+	return faceMap[bestFaceId]
+}
+
+// Sequential rejection sampling. Generates random seeds and simulates each in an isolated
+// world until one lands on targetValue, or maxAttempts exhausted. Posts result back to
+// the rendering worker via "searchResult".
+const doSearch = (req) => {
+	const { searchId, dieType, meshName, targetValue, maxAttempts = 100 } = req
+	const faceKey = `${meshName}_${dieType}`
+	const colliderKey = `${meshName}_${dieType}_collider`
+	const start = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now()
+
+	if (!faceData[faceKey] || !colliders[colliderKey]) {
+		worldWorkerPort.postMessage({
+			action: 'searchResult',
+			searchId,
+			found: false,
+			error: 'missing_face_data_or_collider',
+			attempts: 0,
+		})
+		return
+	}
+
+	for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+		const seed = generateRandomSeed()
+		const finalRotation = simulateOnce(seed, dieType, meshName)
+		if (!finalRotation) continue
+		const value = evaluateFace(finalRotation, faceKey)
+		if (value === targetValue) {
+			const elapsed = ((typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now()) - start
+			worldWorkerPort.postMessage({
+				action: 'searchResult',
+				searchId,
+				found: true,
+				seed,
+				attempts: attempt,
+				elapsedMs: elapsed,
+				restingValue: value,
+				restingRotation: finalRotation,
+			})
+			return
+		}
+	}
+
+	const elapsed = ((typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now()) - start
+	worldWorkerPort.postMessage({
+		action: 'searchResult',
+		searchId,
+		found: false,
+		attempts: maxAttempts,
+		elapsedMs: elapsed,
+	})
 }

@@ -31,6 +31,7 @@ class WorldFacade {
 	#groupIndex = 0
 	#rollIndex = 0
 	#idIndex = 0
+	#searchIndex = 0
 	#DiceWorld = {}
 	#diceWorldPromise
 	#diceWorldResolve
@@ -460,18 +461,24 @@ class WorldFacade {
 	}
 
 	// TODO: pass data with roll - such as roll name. Passed back at the end in the results
-	roll(notation, {theme = this.config.theme, themeColor = this.config.themeColor, newStartPoint = true} = {}) {
+	// forcedValues: optional array of integers, positional per-die in parsed-notation order.
+	// for d100 the convention is two entries [tens, units] e.g. 47 -> [40, 7]; sum=100
+	// is not directly addressable since the inner d10 stores 0-9 (no "10" face) — pass
+	// [0, 0] for sum=0, which represents 100 in some conventions.
+	roll(notation, {theme = this.config.theme, themeColor = this.config.themeColor, newStartPoint = true, forcedValues, seeds} = {}) {
 		// note: to add to a roll on screen use .add method
 		// reset the offscreen worker and physics worker with each new roll
 		this.clear()
 		const collectionId = this.#collectionIndex++
-		
+
 		this.rollCollectionData[collectionId] = new Collection({
 			id: collectionId,
 			notation,
 			theme,
 			themeColor,
-			newStartPoint
+			newStartPoint,
+			forcedValues,
+			seeds
 		})
 
 		const parsedNotation = this.createNotationArray(notation, this.themesLoadedData[theme].diceAvailable)
@@ -481,7 +488,12 @@ class WorldFacade {
 		return this.rollCollectionData[collectionId].promise
 	}
 
-  add(notation, {theme = this.config.theme, themeColor = this.config.themeColor, newStartPoint = true} = {}) {
+  // forcedValues: see roll() — same positional convention; for d100 supply [tens, units]
+  // seeds: optional array of seed objects (positional per-die) to make the visible playback
+  // reproduce a specific search-found trajectory. each seed has shape { startPos, rotation,
+  // linearVel, angularImpulse }. when both forcedValues and seeds are passed, seeds wins
+  // for the visible throw (forcedValues then becomes redundant; only the seed determines outcome).
+  add(notation, {theme = this.config.theme, themeColor = this.config.themeColor, newStartPoint = true, forcedValues, seeds} = {}) {
 
 		const collectionId = this.#collectionIndex++
 
@@ -490,14 +502,33 @@ class WorldFacade {
 			notation,
 			theme,
 			themeColor,
-			newStartPoint
+			newStartPoint,
+			forcedValues,
+			seeds
 		})
-		
+
 		const parsedNotation = this.createNotationArray(notation, this.themesLoadedData[theme].diceAvailable)
 		this.#makeRoll(parsedNotation, collectionId)
 
 		// returns a Promise that is resolved in onRollComplete
 		return this.rollCollectionData[collectionId].promise
+  }
+
+  // Forced-roll search infrastructure (Layer 1, internal — not wired to production roll).
+  // Runs sequential rejection sampling in the physics worker until the die lands on
+  // targetValue. Returns { found, seed?, attempts, elapsedMs, restingValue?, restingRotation? }.
+  // The returned seed can be passed back into add()/roll() via { seeds: [seed] } to replay
+  // the exact trajectory in the visible scene.
+  async searchSeed(dieType, targetValue, { theme = this.config.theme, maxAttempts = 100 } = {}) {
+    const themeData = this.themesLoadedData[theme]
+    if (!themeData) throw new Error(`searchSeed: theme '${theme}' not loaded`)
+    const meshName = themeData.meshName
+    const dt = (typeof dieType === 'number' || /^\d+$/.test(String(dieType))) ? `d${dieType}` : String(dieType)
+    // d10 stores 0 in its colliderFaceMap for the "10" face; translate so the search
+    // matches against the map value rather than the post-processed display value.
+    const lookupValue = (dt === 'd10' && targetValue === 10) ? 0 : targetValue
+    const searchId = ++this.#searchIndex
+    return this.#DiceWorld.searchSeed({ searchId, dieType: dt, meshName, targetValue: lookupValue, maxAttempts })
   }
 
 	reroll(notation, {remove = false, hide = false, newStartPoint = true} = {}) {
@@ -555,6 +586,16 @@ class WorldFacade {
 		const collection = this.rollCollectionData[collectionId]
 		let newStartPoint = collection.newStartPoint
 
+		// pre-compute the forcedValues offset for each notation group, since the async forEach
+		// below interleaves on microtasks and we need a deterministic positional mapping
+		{
+			let forcedCursor = 0
+			parsedNotation.forEach(n => {
+				n._forcedStart = forcedCursor
+				forcedCursor += (n.qty || 0)
+			})
+		}
+
 		// loop through the number of dice in the group and roll each one
 		parsedNotation.forEach(async notation => {
 			if(!notation.sides) {
@@ -610,6 +651,18 @@ class WorldFacade {
           notation.sides =  parseInt(notation.sides.replace('d', ''))
         }
 
+				// positional forced value lookup; undefined means "no force, run physics normally"
+				const forcedValue = Array.isArray(collection.forcedValues)
+					? collection.forcedValues[notation._forcedStart + i]
+					: undefined
+
+				// positional seed lookup (Layer 1 search-replay). when present, the physics worker
+				// uses the seed's exact initial pose/velocity/impulse instead of generating a random
+				// throw — used for replaying a search-found trajectory in the visible scene.
+				const seed = Array.isArray(collection.seeds)
+					? collection.seeds[notation._forcedStart + i]
+					: undefined
+
 				const roll = {
 					sides: notation.sides,
 					data: notation.data,
@@ -620,7 +673,9 @@ class WorldFacade {
 					id,
 					theme,
 					themeColor,
-					meshName
+					meshName,
+					forcedValue,
+					seed
 				}
 
 				rolls[rollId] = roll
@@ -632,19 +687,20 @@ class WorldFacade {
 					console.warn(`fate die unavailable in '${theme}' theme. Using fallback.`)
 					const min = -1
 					const max = 1
-					roll.value = Random.range(min,max)
+					// honor forcedValue in fallback path so behavior matches the 3D path
+					roll.value = (forcedValue !== undefined) ? forcedValue : Random.range(min,max)
 					this.#DiceWorld.addNonDie(roll)
 				} else if(this.config.suspendSimulation || (!diceAvailable.includes(dieType) && !diceExtra.includes(dieType)) || !this.#webgl_support){
 					// check if the requested roll is available in the current theme, if not then use crypto fallback
-					const warning = 
-					!this.#webgl_support 
-						? `This browser does not support webGL. Using random number fallback.` 
-						: this.config.suspendSimulation 
-							? "3D simulation suspended. Using fallback." 
+					const warning =
+					!this.#webgl_support
+						? `This browser does not support webGL. Using random number fallback.`
+						: this.config.suspendSimulation
+							? "3D simulation suspended. Using fallback."
 							: `${roll.sides} die unavailable in '${theme}' theme. Using fallback.`
 					console.warn(warning)
 					const max = Number.isInteger(roll.sides) ? roll.sides : parseInt(roll.sides.replace(/\D/g,''))
-					roll.value = Random.range(1, max)
+					roll.value = (forcedValue !== undefined) ? forcedValue : Random.range(1, max)
 					this.#DiceWorld.addNonDie(roll)
 				} else {
 					let extendedTheme

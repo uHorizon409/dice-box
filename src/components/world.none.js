@@ -27,7 +27,13 @@ class WorldNone {
 	}
 
 	resize(){
-		
+
+	}
+
+	// no-op stub for the no-WebGL fallback. forced rolls in this path use the value-only
+	// fallback in WorldFacade (Random.range overridden by forcedValue), no physics involved.
+	searchSeed(req) {
+		return Promise.resolve({ searchId: req.searchId, found: false, attempts: 0, error: 'no_physics_world' })
 	}
 
 	loadTheme(){

@@ -5,6 +5,7 @@ class WorldOffScreen {
 	offscreenWorkerInit = false
 	themeLoadedInit = false
 	pendingThemePromises = {}
+	pendingSearches = new Map()
 	#offscreenCanvas
 	#OffscreenWorker
 	// onInitComplete = () => {} // init callback
@@ -61,6 +62,14 @@ class WorldOffScreen {
 				case 'die-removed':
 					this.onDieRemoved(e.data.rollId)
 					break;
+				case 'searchResult': {
+					const resolver = this.pendingSearches.get(e.data.searchId)
+					if (resolver) {
+						this.pendingSearches.delete(e.data.searchId)
+						resolver(e.data)
+					}
+					break;
+				}
 			}
 		}
 		// await Promise.all([this.#OffscreenWorker.init])
@@ -114,6 +123,15 @@ class WorldOffScreen {
 	remove(options){
 		// remove the die from the render
 		this.#OffscreenWorker.postMessage({action: "removeDie", options})
+	}
+
+	// forced-roll search: posts request to the inner offscreen worker (which forwards to
+	// physics worker), returns a Promise that resolves with the search result payload.
+	searchSeed(req) {
+		return new Promise((resolve) => {
+			this.pendingSearches.set(req.searchId, resolve)
+			this.#OffscreenWorker.postMessage({ action: "searchSeed", ...req })
+		})
 	}
 }
 

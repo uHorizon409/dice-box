@@ -60,6 +60,14 @@ self.onmessage = async (e) => {
 			WorldOffscreen.connect(e.data.port)
 			self.postMessage({action:"connect-complete"})
       break
+    case "searchSeed": {
+			// Forward forced-roll search request to the physics worker (via WorldOffscreen),
+			// post the resolved result back to main-thread wrapper as a "searchResult" message
+			// keyed by searchId so concurrent searches don't cross.
+			const result = await WorldOffscreen.searchSeed(e.data)
+			self.postMessage({ action: "searchResult", ...result })
+			break
+		}
     default:
       console.error("action not found in offscreen worker")
   }

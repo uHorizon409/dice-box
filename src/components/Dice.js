@@ -1,5 +1,5 @@
 import { SceneLoader } from '@babylonjs/core/Loading/sceneLoader'
-import { Vector3 } from '@babylonjs/core/Maths/math.vector'
+import { Vector3, Quaternion } from '@babylonjs/core/Maths/math.vector'
 import { Color3 } from '@babylonjs/core/Maths/math.color'
 import { Ray } from "@babylonjs/core/Culling/ray";
 // import { RayHelper } from '@babylonjs/core/Debug';
@@ -207,6 +207,115 @@ class Dice {
     return Dice.vector3
   }
 
+  // build a quaternion that rotates `from` onto `to`. assumes both are non-zero.
+  // antiparallel case picks a stable perpendicular axis based on which world axis
+  // is least aligned with `from`, so the resulting flip is on a sensible axis
+  // rather than something derived from a degenerate cross product
+  static _alignVectorRotation(from, to) {
+    const f = from.normalizeToNew()
+    const t = to.normalizeToNew()
+    const dot = Vector3.Dot(f, t)
+    if (dot > 0.999999) {
+      return Quaternion.Identity()
+    }
+    if (dot < -0.999999) {
+      // pick the world axis least parallel to f, cross with f to get a clean perpendicular
+      const ax = Math.abs(f.x), ay = Math.abs(f.y), az = Math.abs(f.z)
+      let candidate
+      if (ax <= ay && ax <= az) candidate = new Vector3(1, 0, 0)
+      else if (ay <= az) candidate = new Vector3(0, 1, 0)
+      else candidate = new Vector3(0, 0, 1)
+      const axis = Vector3.Cross(f, candidate).normalize()
+      return Quaternion.RotationAxis(axis, Math.PI)
+    }
+    const axis = Vector3.Cross(f, t).normalize()
+    const angle = Math.acos(Math.max(-1, Math.min(1, dot)))
+    return Quaternion.RotationAxis(axis, angle)
+  }
+
+  // find one faceId whose value equals the requested forced value. returns null if absent.
+  static _findFaceIdForValue(faceMap, value) {
+    for (const faceId in faceMap) {
+      if (faceMap[faceId] === value) return parseInt(faceId)
+    }
+    return null
+  }
+
+  // pull the local-space normal of one face from the collider's facet data
+  static _getLocalFaceNormal(colliderMesh, faceId) {
+    const normals = colliderMesh.getFacetLocalNormals()
+    if (!normals || !normals[faceId]) return null
+    return normals[faceId].clone()
+  }
+
+  // post-settle finish: physics has fully settled, now do a brief tip animation that lifts the
+  // die slightly, rotates from rest to target, and drops back down. mimics a real die's final
+  // wobble onto its next face. doesn't touch physics during tumble, so the throw + tumble + rest
+  // all look 100% natural. only the last ~700ms is the visible "settle adjustment".
+  static startForcedFinish(die, scene) {
+    const d = die
+    if (d._forcedFinishStarted) return true
+    const forcedValue = d.config && d.config.forcedValue
+    if (forcedValue === undefined) return false
+    const meshName = d.config.parentMesh || d.config.meshName
+    const meshFaceIds = scene.themeData[meshName] && scene.themeData[meshName].colliderFaceMap
+    if (!meshFaceIds || !meshFaceIds[d.dieType]) return false
+    const d4FaceDown = scene.themeData[meshName].d4FaceDown
+    const lookupValue = (d.dieType === 'd10' && forcedValue === 10) ? 0 : forcedValue
+    const targetFaceId = Dice._findFaceIdForValue(meshFaceIds[d.dieType], lookupValue)
+    if (targetFaceId === null) return false
+    const colliderMesh = scene.getMeshByName(`${meshName}_${d.dieType}_collider`)
+    const faceNormalLocal = Dice._getLocalFaceNormal(colliderMesh, targetFaceId)
+    if (!faceNormalLocal) return false
+    const upVector = (d.dieType === 'd4' && d4FaceDown) ? new Vector3(0, -1, 0) : new Vector3(0, 1, 0)
+    const rot = Dice._alignVectorRotation(faceNormalLocal, upVector)
+    if (typeof d.mesh.unfreezeWorldMatrix === 'function') d.mesh.unfreezeWorldMatrix()
+    if (!d.mesh.rotationQuaternion) d.mesh.rotationQuaternion = new Quaternion()
+    d.value = lookupValue
+    d._forcedFinishStarted = true
+    d._forcedRotationApplied = true   // block buffer-loop from overwriting during animation
+    d._forcedTargetQ = rot
+    Dice._animatePostSettleFinish(d, scene, 700)
+    return true
+  }
+
+  // tip-and-fall animation: lifts die ~10% of its size, slerps rotation rest→target, drops.
+  // ease-out cubic on rotation (fast lift, gentle settle). sine arc on Y for the bounce.
+  static _animatePostSettleFinish(d, scene, durationMs) {
+    if (!d.mesh || !d._forcedTargetQ) return
+    const _rAF = (typeof requestAnimationFrame === 'function')
+      ? requestAnimationFrame
+      : (cb) => setTimeout(cb, 16)
+    const _now = () => (typeof performance !== 'undefined' && performance.now)
+      ? performance.now()
+      : Date.now()
+    const fromQ = d.mesh.rotationQuaternion.clone()
+    const toQ = d._forcedTargetQ.clone()
+    const startY = d.mesh.position.y
+    // rough lift = die scale * 0.4 — enough to look like the die hopped briefly
+    const cfgScale = (d.config && d.config.scale) || 5
+    const liftHeight = cfgScale * 0.4
+    const startTime = _now()
+    const step = () => {
+      if (!d.mesh || (d.mesh.isDisposed && d.mesh.isDisposed())) return
+      const elapsed = _now() - startTime
+      const t = Math.min(1, elapsed / durationMs)
+      // ease-out cubic for rotation
+      const rotT = 1 - Math.pow(1 - t, 3)
+      // sine arc for vertical lift, peaks at t=0.5
+      const liftT = Math.sin(t * Math.PI)
+      const q = Quaternion.Slerp(fromQ, toQ, rotT)
+      if (!d.mesh.rotationQuaternion) d.mesh.rotationQuaternion = new Quaternion()
+      d.mesh.rotationQuaternion.set(q.x, q.y, q.z, q.w)
+      d.mesh.position.y = startY + liftHeight * liftT
+      if (typeof d.mesh.computeWorldMatrix === 'function') d.mesh.computeWorldMatrix(true)
+      try { scene.render() } catch (_) { /* engine may have stopped */ }
+      if (t < 1) _rAF(step)
+      else d.mesh.position.y = startY // ensure final Y is exactly at rest
+    }
+    _rAF(step)
+  }
+
   static async getRollResult(die,scene) {
     // TODO: Why a function in a function?? fix this
     const getDieRoll = (d=die) => new Promise((resolve,reject) => {
@@ -217,6 +326,24 @@ class Dice {
 
       if(!meshFaceIds[d.dieType]){
         throw new Error(`No colliderFaceMap data for ${d.dieType}`)
+      }
+
+      // forced result fast-path: if the buffer-loop already triggered the early finish on
+      // velocity slowdown, d.value is set and animation is running — just resolve. otherwise
+      // start it now (this happens when handleAsleep fires before slowdown is detected, e.g.
+      // very short physics throws).
+      const forcedValue = d.config.forcedValue
+      const lookupValue = (forcedValue !== undefined && d.dieType === 'd10' && forcedValue === 10)
+        ? 0
+        : forcedValue
+      if (forcedValue !== undefined) {
+        if (d._forcedFinishStarted) {
+          return resolve(d.value)
+        }
+        if (Dice.startForcedFinish(d, scene)) {
+          return resolve(d.value)
+        }
+        console.warn(`forcedValue ${forcedValue} not found in colliderFaceMap for ${d.dieType} — falling back to physics result`)
       }
 
       // const dieHitbox = d.config.scene.getMeshByName(`${d.dieType}_collider`).createInstance(`${d.dieType}-hitbox-${d.id}`)
@@ -249,13 +376,18 @@ class Dice {
         d.value = 0
       }
 
+      // safety net for the unmatched-forced-value fallback path
+      if (forcedValue !== undefined && d.value !== lookupValue) {
+        d.value = lookupValue
+      }
+
       return resolve(d.value)
     }).catch(error => console.error(error))
 
     if(!die.mesh){
       return die.value
     }
-    
+
     return await getDieRoll()
   }
 }

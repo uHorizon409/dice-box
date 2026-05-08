@@ -1,4 +1,4 @@
-import { Vector3 } from '@babylonjs/core/Maths/math.vector'
+import { Vector3, Quaternion } from '@babylonjs/core/Maths/math.vector'
 import { createEngine } from './world/engine'
 import { createScene } from './world/scene'
 import { createCamera } from './world/camera'
@@ -23,6 +23,8 @@ class WorldOnscreen {
 	#themeLoader
 	#physicsWorkerPort
 	#meshList = {}
+	#sentFaceData = new Set()
+	#pendingSearches = new Map()
 	noop = () => {}
 	diceBufferView = new Float32Array(8000)
 
@@ -82,12 +84,60 @@ class WorldOnscreen {
 				case "updates": // dice status/position updates from physics worker
 					this.updatesFromPhysics(e.data.diceBuffer)
 					break;
-			
+				case "searchResult": {
+					// physics worker found (or failed to find) a seed for a forced-roll search.
+					// resolve the matching pending Promise from searchSeed().
+					const resolver = this.#pendingSearches.get(e.data.searchId)
+					if (resolver) {
+						this.#pendingSearches.delete(e.data.searchId)
+						resolver(e.data)
+					}
+					break;
+				}
 				default:
 					console.error("action from physicsWorker not found in offscreen worker")
 					break;
 			}
 		}
+	}
+
+	// public API for forced-roll search. returns a Promise resolving to the searchResult
+	// payload from the physics worker: { found, seed?, attempts, elapsedMs, restingValue?,
+	// restingRotation? } — see physics.worker.js doSearch() for full shape.
+	searchSeed(req) {
+		return new Promise((resolve) => {
+			this.#pendingSearches.set(req.searchId, resolve)
+			this.#physicsWorkerPort.postMessage({ action: "searchSeed", ...req })
+		})
+	}
+
+	// extract local face normals + faceId-to-value map from the loaded collider mesh and ship
+	// to the physics worker, so it can evaluate which face is up after a search simulation
+	// without needing a Babylon scene. idempotent per (meshName, dieType).
+	#ensureFaceDataLoaded(meshName, dieType) {
+		const key = `${meshName}_${dieType}`
+		if (this.#sentFaceData.has(key)) return
+		const colliderMesh = this.#scene.getMeshByName(`${meshName}_${dieType}_collider`)
+		if (!colliderMesh) return
+		const themeData = this.#scene.themeData && this.#scene.themeData[meshName]
+		if (!themeData || !themeData.colliderFaceMap || !themeData.colliderFaceMap[dieType]) return
+		const localNormals = colliderMesh.getFacetLocalNormals()
+		if (!localNormals || localNormals.length === 0) return
+		const faceNormals = new Float32Array(localNormals.length * 3)
+		for (let i = 0; i < localNormals.length; i++) {
+			faceNormals[i * 3] = localNormals[i].x
+			faceNormals[i * 3 + 1] = localNormals[i].y
+			faceNormals[i * 3 + 2] = localNormals[i].z
+		}
+		this.#physicsWorkerPort.postMessage({
+			action: "loadFaceData",
+			key,
+			dieType,
+			faceNormals: faceNormals.buffer,
+			faceMap: themeData.colliderFaceMap[dieType],
+			d4FaceDown: themeData.d4FaceDown,
+		}, [faceNormals.buffer])
+		this.#sentFaceData.add(key)
 	}
 
 	updateConfig(options){
@@ -258,6 +308,10 @@ class WorldOnscreen {
 		// save the die just created to the cache
 		this.#dieCache[newDie.id] = newDie
 		
+		// best-effort: ship face-data to physics worker once per mesh+dieType so any future
+		// searchSeed call can evaluate the resting face. no-op after the first add per type.
+		this.#ensureFaceDataLoaded(options.meshName, newDie.dieType)
+
 		// tell the physics engine to roll this die type - which is a low poly collider
 		this.#physicsWorkerPort.postMessage({
 			action: "addDie",
@@ -268,6 +322,7 @@ class WorldOnscreen {
 				newStartPoint: options.newStartPoint,
 				theme: options.theme,
 				meshName: options.meshName,
+				seed: options.seed, // optional: when present, physics replays this exact throw
 			}
 		})
 	
@@ -353,6 +408,8 @@ class WorldOnscreen {
 		// if the first position index is -1 then this die has been flagged as asleep
 		if(this.diceBufferView[bufferIndex + 1] === -1) {
 			this.handleAsleep(die)
+		} else if(die._forcedRotationApplied) {
+			// forced finish complete — ignore further physics updates
 		} else {
 			const px = this.diceBufferView[bufferIndex + 1]
 			const py = this.diceBufferView[bufferIndex + 2]
@@ -362,6 +419,7 @@ class WorldOnscreen {
 			const qz = this.diceBufferView[bufferIndex + 6]
 			const qw = this.diceBufferView[bufferIndex + 7]
 
+			// don't override physics during tumble — let it run completely naturally
 			die.mesh.position.set(px, py, pz)
 			die.mesh.rotationQuaternion.set(qx, qy, qz, qw)
 		}
@@ -380,9 +438,13 @@ class WorldOnscreen {
 	
 	// handle the position updates from the physics worker. It's a simple flat array of numbers for quick and easy transfer
 	async handleAsleep(die){
+		// guard against re-entry if physics sends multiple -1 sentinels for the same die
+		if (die._handleAsleepFired) return
+		die._handleAsleepFired = true
+
 		// mark this die as asleep
 		die.asleep = true
-	
+
 		// get the roll result for this die
 		await Dice.getRollResult(die, this.#scene)
 	
