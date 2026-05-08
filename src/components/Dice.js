@@ -279,8 +279,13 @@ class Dice {
     return true
   }
 
-  // tip-and-fall animation: lifts die ~10% of its size, slerps rotation rest→target, drops.
-  // ease-out cubic on rotation (fast lift, gentle settle). sine arc on Y for the bounce.
+  // tip-and-rock animation: each die settles on its own clock with subtle vertical motion
+  // and rotation toward the forced target face. The original "all dice lift+rotate in
+  // lockstep" version read as rigged because the synchronization tipped the brain off.
+  // Per-die randomization (start delay + duration variance) breaks that — observer sees
+  // dice settling independently the way real physics would after a chaotic Fireball-class
+  // roll. Lift is reduced and peaks earlier so the motion looks like the die rocked onto
+  // its final face rather than hopped.
   static _animatePostSettleFinish(d, scene, durationMs) {
     if (!d.mesh || !d._forcedTargetQ) return
     const _rAF = (typeof requestAnimationFrame === 'function')
@@ -292,18 +297,28 @@ class Dice {
     const fromQ = d.mesh.rotationQuaternion.clone()
     const toQ = d._forcedTargetQ.clone()
     const startY = d.mesh.position.y
-    // rough lift = die scale * 0.4 — enough to look like the die hopped briefly
     const cfgScale = (d.config && d.config.scale) || 5
-    const liftHeight = cfgScale * 0.4
-    const startTime = _now()
+    // reduced from 0.4 to 0.15 so the die looks like it's tipping onto an edge rather
+    // than hopping clear off the table — real settling dice don't visibly leave the floor
+    const liftHeight = cfgScale * 0.15
+    // per-die jitter: 0-300ms start delay + 0.8x-1.3x duration variance. Eight dice with
+    // identical 700ms snap profiles read as scripted; spread them across ~300ms-1200ms
+    // total elapsed and the eye reads it as independent settling.
+    const startDelay = Math.random() * 300
+    const dynDuration = durationMs * (0.8 + Math.random() * 0.5)
+    const startTime = _now() + startDelay
     const step = () => {
       if (!d.mesh || (d.mesh.isDisposed && d.mesh.isDisposed())) return
-      const elapsed = _now() - startTime
-      const t = Math.min(1, elapsed / durationMs)
-      // ease-out cubic for rotation
+      const now = _now()
+      if (now < startTime) { _rAF(step); return }
+      const elapsed = now - startTime
+      const t = Math.min(1, elapsed / dynDuration)
+      // ease-out cubic for rotation — fast initial tip, gentle final alignment
       const rotT = 1 - Math.pow(1 - t, 3)
-      // sine arc for vertical lift, peaks at t=0.5
-      const liftT = Math.sin(t * Math.PI)
+      // asymmetric arc for vertical lift: peaks earlier at t≈0.3 (not 0.5) so the lift
+      // looks like the die tipping onto an edge briefly rather than a clean parabolic hop.
+      // Math: sin(π * t^0.6) skews the peak left.
+      const liftT = Math.sin(Math.pow(t, 0.6) * Math.PI)
       const q = Quaternion.Slerp(fromQ, toQ, rotT)
       if (!d.mesh.rotationQuaternion) d.mesh.rotationQuaternion = new Quaternion()
       d.mesh.rotationQuaternion.set(q.x, q.y, q.z, q.w)
