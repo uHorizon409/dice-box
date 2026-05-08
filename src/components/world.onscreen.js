@@ -308,10 +308,20 @@ class WorldOnscreen {
 	add(options) {
 		// loadDie allows you to specify sides(dieType) and theme and returns the options you passed in
 		Dice.loadDie(options, this.#scene).then(resp => {
-			// space out adding the dice so they don't lump together too much
-			this.#dieRollTimer.push(setTimeout(() => {
+			// seeded rolls (Layer 1+) must enter physics simultaneously so the visible
+			// replay matches the search world's collision dynamics — search adds all dice
+			// before any stepSimulation, so production replay has to do the same. The
+			// per-die `count * delay` stagger in the unseeded path exists to prevent
+			// visual lumping and physics-popping; seeded rolls don't need it (seeds have
+			// deterministic trajectories), and skipping it closes the ~20% face-divergence
+			// on multi-die seeded rolls (2d20 etc).
+			if (options.seed) {
 				this.#add(resp)
-			}, this.#count++ * this.config.delay))
+			} else {
+				this.#dieRollTimer.push(setTimeout(() => {
+					this.#add(resp)
+				}, this.#count++ * this.config.delay))
+			}
 		})
 	}
 
