@@ -132,7 +132,9 @@ self.onmessage = (e) => {
 						// sequential rejection sampling. runs invisibly to find a seed (initial
 						// position/velocity/angularVelocity/rotation) that lands the die on the
 						// requested face value. result posted back via "searchResult".
-						doSearch(e.data)
+						// pair: true → d100 split-search (d100 + inner d10 in same search world)
+						if (e.data.pair) doPairSearch(e.data)
+						else doSearch(e.data)
 						break
           default:
             console.error("action not found in physics worker from worldOffscreen worker:", e.data.action)
@@ -778,9 +780,13 @@ const addSearchBoxToWorld = (world, size, height) => {
 	return parts
 }
 
-// Persistent search world: built once, reused across all search attempts. Avoids OOM from
-// constructing+leaking a full Ammo world per attempt. Layer 2 will scale this to a pool of N.
+// Search world: rebuilt fresh per searchSeed call. Avoids OOM from constructing one per
+// attempt (which we tried earlier) AND avoids cross-search state accumulation in Bullet's
+// broadphase/solver cache (which we observed causing certain target values to fail
+// consistently after many prior searches in the same session). Layer 2 will scale this to
+// a pool of N reusable worlds with explicit reset between checkout cycles.
 let searchWorld = null
+let searchWorldWalls = []
 
 const ensureSearchWorld = () => {
 	if (searchWorld) return
@@ -790,65 +796,99 @@ const ensureSearchWorld = () => {
 	const solver = new Ammo.btSequentialImpulseConstraintSolver()
 	const world = new Ammo.btDiscreteDynamicsWorld(dispatcher, broadphase, solver, cc)
 	world.setGravity(setVector3(0, -9.81 * config.gravity, 0))
-	addSearchBoxToWorld(world, config.size, config.startingHeight + 10)
+	searchWorldWalls = addSearchBoxToWorld(world, config.size, config.startingHeight + 10)
 	searchWorld = world
 }
 
-// Run one simulation in the persistent search world: add a die thrown with the given seed,
-// fast-forward at fixed 1/90s substeps until settle, read final rotation, remove the die.
-// Returns the resting rotation as [x,y,z,w], or null if the die didn't settle in time.
-const simulateOnce = (seed, dieType, meshName) => {
-	ensureSearchWorld()
-	const cKey = `${meshName}_${dieType}_collider`
-	const colliderInfo = colliders[cKey]
-	if (!colliderInfo) return null
-
-	const colliderMass = colliderInfo.physicsMass || .1
-	const mass = colliderMass * config.mass * config.scale
-	const dieBody = createRigidBody(colliderInfo.convexHull, {
-		mass,
-		scaling: colliderInfo.scaling,
-		pos: seed.startPos,
-		quat: seed.rotation,
-	})
-	dieBody.mass = mass
-	searchWorld.addRigidBody(dieBody)
-
-	dieBody.setLinearVelocity(setVector3(seed.linearVel[0], seed.linearVel[1], seed.linearVel[2]))
-	const force = new Ammo.btVector3(seed.angularImpulse[0], seed.angularImpulse[1], seed.angularImpulse[2])
-	const impulseScale = Math.abs(config.scale - 1) + config.scale * config.scale * (mass / config.mass) * .75
-	dieBody.applyImpulse(force, setVector3(impulseScale, impulseScale, impulseScale))
-	Ammo.destroy(force)
-
-	// fast-forward at 1/90s fixed substeps until settle. cap at ~6.6s of simulated time.
-	const maxSteps = 600
-	let settled = false
-	for (let i = 0; i < maxSteps; i++) {
-		searchWorld.stepSimulation(1/90, 1, 1/90)
-		const speed = dieBody.getLinearVelocity().length()
-		const tilt = dieBody.getAngularVelocity().length()
-		if (speed < .01 && tilt < .005) {
-			settled = true
-			break
+// Tear down the search world and rebuild fresh — call before each top-level search to
+// eliminate broadphase/solver state from previous searches.
+const resetSearchWorld = () => {
+	if (searchWorld) {
+		for (const w of searchWorldWalls) {
+			searchWorld.removeRigidBody(w)
+			Ammo.destroy(w)
 		}
+		searchWorldWalls = []
+		Ammo.destroy(searchWorld)
+		searchWorld = null
+	}
+	ensureSearchWorld()
+}
+
+// Run one simulation with N dice in the persistent search world: each thrown with its own
+// seed, all share the same world (so collisions between them mirror the visible playback).
+// Fast-forwards until ALL bodies settle, returns array of resting rotations [x,y,z,w] per
+// body, or null if any didn't settle in time. Used by both single-die and pair-die searches.
+const simulateOnceN = (seeds, dieTypes, meshName) => {
+	ensureSearchWorld()
+	const bodies = []
+
+	for (let k = 0; k < seeds.length; k++) {
+		const cKey = `${meshName}_${dieTypes[k]}_collider`
+		const colliderInfo = colliders[cKey]
+		if (!colliderInfo) {
+			// roll back any bodies already added before bailing
+			for (const b of bodies) { searchWorld.removeRigidBody(b); Ammo.destroy(b) }
+			return null
+		}
+		const colliderMass = colliderInfo.physicsMass || .1
+		const mass = colliderMass * config.mass * config.scale
+		const dieBody = createRigidBody(colliderInfo.convexHull, {
+			mass,
+			scaling: colliderInfo.scaling,
+			pos: seeds[k].startPos,
+			quat: seeds[k].rotation,
+		})
+		dieBody.mass = mass
+		searchWorld.addRigidBody(dieBody)
+		dieBody.setLinearVelocity(setVector3(seeds[k].linearVel[0], seeds[k].linearVel[1], seeds[k].linearVel[2]))
+		const force = new Ammo.btVector3(seeds[k].angularImpulse[0], seeds[k].angularImpulse[1], seeds[k].angularImpulse[2])
+		const impulseScale = Math.abs(config.scale - 1) + config.scale * config.scale * (mass / config.mass) * .75
+		dieBody.applyImpulse(force, setVector3(impulseScale, impulseScale, impulseScale))
+		Ammo.destroy(force)
+		bodies.push(dieBody)
 	}
 
-	let result = null
-	if (settled) {
+	// fast-forward at 1/90s fixed substeps until ALL bodies settle. cap at ~6.6s simulated.
+	const maxSteps = 600
+	let allSettled = false
+	for (let i = 0; i < maxSteps; i++) {
+		searchWorld.stepSimulation(1/90, 1, 1/90)
+		allSettled = true
+		for (const b of bodies) {
+			const speed = b.getLinearVelocity().length()
+			const tilt = b.getAngularVelocity().length()
+			if (speed >= .01 || tilt >= .005) { allSettled = false; break }
+		}
+		if (allSettled) break
+	}
+
+	let results = null
+	if (allSettled) {
+		results = []
 		const tmpT = new Ammo.btTransform()
-		dieBody.getMotionState().getWorldTransform(tmpT)
-		const q = tmpT.getRotation()
-		result = [q.x(), q.y(), q.z(), q.w()]
+		for (const b of bodies) {
+			b.getMotionState().getWorldTransform(tmpT)
+			const q = tmpT.getRotation()
+			results.push([q.x(), q.y(), q.z(), q.w()])
+		}
 		Ammo.destroy(tmpT)
 	}
 
-	// remove the die from the world and destroy it. the motion state, construction info, and
-	// transform allocated inside createRigidBody are not directly accessible — they leak per
-	// attempt (~280 bytes total) but at 100 attempts that's only ~28KB. acceptable for Layer 1.
-	searchWorld.removeRigidBody(dieBody)
-	Ammo.destroy(dieBody)
+	// teardown — remove + destroy each body. motion state/transform/info allocated inside
+	// createRigidBody are not directly accessible and leak per attempt (~280 bytes per body).
+	for (const b of bodies) {
+		searchWorld.removeRigidBody(b)
+		Ammo.destroy(b)
+	}
 
-	return result
+	return results
+}
+
+// Single-die wrapper for backwards compatibility with doSearch().
+const simulateOnce = (seed, dieType, meshName) => {
+	const results = simulateOnceN([seed], [dieType], meshName)
+	return results ? results[0] : null
 }
 
 // Determine which face is up given a final rotation. Rotates each precomputed local face
@@ -881,6 +921,56 @@ const evaluateFace = (rotation, faceKey) => {
 	return faceMap[bestFaceId]
 }
 
+// Pair-search for d100: throws BOTH the d100 body and its inner d10 in the same search
+// world (so collisions between them mirror the visible playback's two-body simulation).
+// Hit rate ~1/100 per attempt instead of 1/10 × 1/10 — but the resulting seeds reproduce
+// faithfully because the visible world has the same collision dynamics. Returns a paired
+// seed where the d10's seed is nested under .d10Seed.
+const doPairSearch = (req) => {
+	const { searchId, meshName, tensValue, unitsValue, maxAttempts = 100 } = req
+	const tensFaceKey = `${meshName}_d100`
+	const unitsFaceKey = `${meshName}_d10`
+	const start = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now()
+
+	if (!faceData[tensFaceKey] || !faceData[unitsFaceKey]
+		|| !colliders[`${meshName}_d100_collider`] || !colliders[`${meshName}_d10_collider`]) {
+		worldWorkerPort.postMessage({
+			action: 'searchResult', searchId, found: false,
+			error: 'missing_face_data_or_collider', attempts: 0,
+		})
+		return
+	}
+
+	// fresh world per top-level search — eliminates cross-search broadphase/solver state
+	resetSearchWorld()
+
+	for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+		const tensSeed = generateRandomSeed()
+		const unitsSeed = generateRandomSeed()
+		const results = simulateOnceN([tensSeed, unitsSeed], ['d100', 'd10'], meshName)
+		if (!results) continue
+		const tensActual = evaluateFace(results[0], tensFaceKey)
+		const unitsActual = evaluateFace(results[1], unitsFaceKey)
+		if (tensActual === tensValue && unitsActual === unitsValue) {
+			const elapsed = ((typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now()) - start
+			worldWorkerPort.postMessage({
+				action: 'searchResult', searchId, found: true,
+				seed: { ...tensSeed, d10Seed: unitsSeed },
+				attempts: attempt, elapsedMs: elapsed,
+				// (0,0) → 100 per dice-box convention, otherwise straight sum
+				restingValue: (tensValue === 0 && unitsValue === 0) ? 100 : tensValue + unitsValue,
+			})
+			return
+		}
+	}
+
+	const elapsed = ((typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now()) - start
+	worldWorkerPort.postMessage({
+		action: 'searchResult', searchId, found: false,
+		attempts: maxAttempts, elapsedMs: elapsed,
+	})
+}
+
 // Sequential rejection sampling. Generates random seeds and simulates each in an isolated
 // world until one lands on targetValue, or maxAttempts exhausted. Posts result back to
 // the rendering worker via "searchResult".
@@ -900,6 +990,9 @@ const doSearch = (req) => {
 		})
 		return
 	}
+
+	// fresh world per top-level search — eliminates cross-search broadphase/solver state
+	resetSearchWorld()
 
 	for (let attempt = 1; attempt <= maxAttempts; attempt++) {
 		const seed = generateRandomSeed()

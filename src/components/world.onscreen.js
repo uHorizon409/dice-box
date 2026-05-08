@@ -344,7 +344,10 @@ class WorldOnscreen {
 					scale: this.config.scale,
 					id: newDie.d10Instance.id,
 					theme: options.theme,
-					meshName: options.meshName
+					meshName: options.meshName,
+					// d100 split-dice (Layer 5): the parent d100's seed wraps the inner d10's
+					// seed under .d10Seed when the roll was started via { seeds: [pairedSeed] }.
+					seed: options.seed ? options.seed.d10Seed : undefined,
 				}
 			})
 		}
@@ -461,8 +464,16 @@ class WorldOnscreen {
 				// save the original value
 				d100.rawValue = d100.value
 
-				d100.value = d100.value + d10.value
-	
+				// d100 convention (matching world.none.js): dice-box maps (d100=0, d10=0) → 100,
+				// otherwise straight sum. Upstream world.onscreen.js was missing this case so
+				// "00 + 0" reported as 0 instead of D&D-convention 100. Layer 5 search relies on
+				// this mapping to make forced d100=100 work via (tens=0, units=0) seeds.
+				if (d10.value === 0 && d100.value === 0) {
+					d100.value = 100
+				} else {
+					d100.value = d100.value + d10.value
+				}
+
 				this.onRollResult({
 					rollId: d100.config.rollId,
 					value : d100.value
